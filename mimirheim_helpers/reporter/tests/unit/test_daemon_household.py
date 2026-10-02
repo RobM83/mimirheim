@@ -81,6 +81,16 @@ def test_write_household_is_fault_isolated(
     assert not (tmp_path / "household.html").exists()
 
 
+def test_household_disabled_writes_nothing(
+    tmp_path: Path, fixture_inp: dict, fixture_out: dict
+) -> None:
+    """With household_enabled false, no household page is written."""
+    daemon = _daemon(tmp_path)
+    daemon._reporter_config.household_enabled = False
+    daemon._write_household(fixture_inp, fixture_out)
+    assert not (tmp_path / "household.html").exists()
+
+
 def test_refresh_household_latest_picks_newest(
     tmp_path: Path, fixture_inp: dict, fixture_out: dict
 ) -> None:
