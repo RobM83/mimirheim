@@ -26,11 +26,7 @@ import html
 import json
 from typing import Any
 
-from reporter.metrics import (
-    _STEP_HOURS,
-    compute_economic_metrics,
-    compute_schedule_metrics,
-)
+from reporter.metrics import compute_economic_metrics, compute_schedule_metrics
 
 _LOAD_TYPES = ("static_load", "deferrable_load")
 
@@ -121,7 +117,6 @@ def _build_payload(inp: dict, out: dict) -> dict[str, Any]:
         "pv": m.pv_total_kwh,
         "load": m.load_total_kwh,
         "self": m.self_sufficiency_pct,
-        "step_hours": _STEP_HOURS,
     }
     return {
         "t": t,
@@ -271,8 +266,8 @@ footer{margin-top:30px;color:var(--soft);font-size:12.5px;line-height:1.6;text-a
 const D = JSON.parse(document.getElementById('household-data').textContent);
 const TZ = (Intl.DateTimeFormat().resolvedOptions().timeZone) || 'UTC';
 let L = 'nl';
-const STEP_MIN = Math.round((D.summary.step_hours || 0.25) * 60);
-const STEP_MS = STEP_MIN * 60000;
+// Step duration straight from the data (fallback 15 min for a 0/1-step plan).
+const STEP_MS = D.t.length>1 ? (new Date(D.t[1])-new Date(D.t[0])) : 900000;
 
 const IC = {
   sun:  c=>`<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.2" fill="${c}"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/></svg>`,
