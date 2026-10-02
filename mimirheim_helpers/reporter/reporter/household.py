@@ -144,6 +144,8 @@ _PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- Reload periodically so a left-open tablet / embedded frame tracks new solves. -->
+<meta http-equiv="refresh" content="300">
 <title>Ons huis vandaag — energieplan</title>
 <style>
 :root{
