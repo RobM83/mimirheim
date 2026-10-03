@@ -22,7 +22,6 @@ standalone prototype; here they are driven by the dump pair server-side.
 """
 from __future__ import annotations
 
-import html
 import json
 from typing import Any
 
