@@ -323,7 +323,7 @@ class ReporterDaemon(MqttDaemon):
             out: Parsed SolveResult JSON.
         """
         cfg = self._reporter_config
-        if not getattr(cfg, "household_enabled", True):
+        if not cfg.household_enabled:
             return
         dest = cfg.output_dir / _HOUSEHOLD_FILENAME
         try:

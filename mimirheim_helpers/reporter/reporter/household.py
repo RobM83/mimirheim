@@ -8,14 +8,49 @@ electricity today, and is it smart?*
 
 What this module does:
     - Produce a complete, self-contained HTML page from a dump pair, with the
-      per-step series and summary embedded as a JSON data block and a small
+      per-step flows and summary embedded as a JSON data block and a small
       client script (hand-drawn SVG, no Plotly) that presents it, NL/EN.
     - Expose ``build_household_html(inp, out) -> str`` as the sole public function.
 
 What this module does not do:
     - Read or write files, or publish MQTT.
     - Import from ``mimirheim``.
+    - Infer anything the solver already decided. Every flow is read off the
+      devices in the schedule; the page script only draws what it is given.
     - Re-derive economics or energy totals — those come from ``metrics``.
+
+Device types
+------------
+Every step's devices are read by ``type``. The schedule balances exactly
+(sum of device ``kw`` + grid import - grid export = 0), so reading each device
+keeps the arithmetic true by construction:
+
+    ``pv``                  Generation ("sun").
+    ``battery``             Storage. Positive ``kw`` is discharge to the house,
+                            negative is charging.
+    ``hybrid_inverter``     Storage with its own DC panels behind one AC output.
+                            Its AC ``kw`` is split into sun and battery using the
+                            solver's planned SOC for that step and the device's
+                            configured efficiencies: energy leaving the cell is
+                            battery, the rest of the AC output is its sun; a
+                            rising SOC while the AC side is not drawing power is
+                            its sun charging the battery.
+    ``ev_charger``          Consumption while charging (part of house usage,
+                            never "the battery filling up"); a positive ``kw``
+                            (vehicle-to-home) counts as battery.
+    ``static_load``,
+    ``deferrable_load``,
+    ``thermal_boiler``,
+    ``space_heating_hp``,
+    ``combi_heat_pump``     Consumption (part of house usage).
+    anything else           Not broken out: negative ``kw`` counts as house
+                            usage, positive ``kw`` as an "other" source. The
+                            page says so in its footer rather than folding it
+                            into sun, battery or grid.
+
+Within a step, house usage is met by sun first, then battery, then other
+sources, then the grid; storage charging by leftover sun first, then the grid.
+That allocation is a presentation choice; every quantity it allocates is read.
 
 The visual design and client presentation logic were ported from a working
 standalone prototype; here they are driven by the dump pair server-side.
@@ -23,14 +58,32 @@ standalone prototype; here they are driven by the dump pair server-side.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from reporter.metrics import compute_economic_metrics, compute_schedule_metrics
 
-_LOAD_TYPES = ("static_load", "deferrable_load")
+_PV_TYPES = frozenset({"pv"})
+_BATTERY_TYPES = frozenset({"battery"})
+_HYBRID_TYPES = frozenset({"hybrid_inverter"})
+_EV_TYPES = frozenset({"ev_charger"})
+_LOAD_TYPES = frozenset(
+    {
+        "static_load",
+        "deferrable_load",
+        "thermal_boiler",
+        "space_heating_hp",
+        "combi_heat_pump",
+    }
+)
+
+# Below this a flow is treated as idle when labelling what the house is doing.
+_MODE_THRESHOLD_KW = 0.03
+# Below this a plan saving is "nothing worth mentioning".
+_SAVING_THRESHOLD_EUR = 0.005
 
 
-def build_household_html(inp: dict, out: dict) -> str:
+def build_household_html(inp: dict[str, Any], out: dict[str, Any]) -> str:
     """Build the household (layperson) HTML page from a mimirheim dump pair.
 
     Args:
@@ -44,89 +97,230 @@ def build_household_html(inp: dict, out: dict) -> str:
     """
     payload = _build_payload(inp, out)
     data_json = json.dumps(payload, separators=(",", ":"))
-    # The payload is numeric + ISO timestamps, so it cannot contain "</script>";
-    # escaping the forward slash is belt-and-braces against a stray sequence.
+    # The payload is numeric, ISO timestamps and fixed labels, so it cannot
+    # contain "</script>"; escaping the forward slash is belt-and-braces.
     data_json = data_json.replace("</", "<\\/")
     return _PAGE.replace("__HOUSEHOLD_DATA__", data_json)
 
 
-def _build_payload(inp: dict, out: dict) -> dict[str, Any]:
-    """Compute the embedded data payload from a dump pair.
-
-    Per-step series follow the same sign conventions as ``metrics.py``:
-    PV is the positive kW of ``type == "pv"`` devices; load is the negated kW of
-    ``static_load``/``deferrable_load`` devices; grid flows come straight off the
-    step. Summary figures are taken from the shared metrics functions so the
-    household view can never disagree with the technical report.
-    """
+def _build_payload(inp: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
+    """Read every step's devices into explicit per-step flows plus a summary."""
     schedule = out.get("schedule", []) or []
     eco = compute_economic_metrics(out)
     m = compute_schedule_metrics(schedule)
+    step_h = _step_hours(schedule)
 
-    t: list[str] = []
-    price: list[float] = []
-    exp: list[float] = []
-    pv: list[float] = []
-    load: list[float] = []
-    imp: list[float] = []
-    expo: list[float] = []
+    hybrid_cfg = (inp.get("config") or {}).get("hybrid_inverters") or {}
+    soc: dict[str, float] = {
+        name: float(v.get("soc_kwh", 0.0) or 0.0)
+        for name, v in (inp.get("hybrid_inverter_inputs") or {}).items()
+    }
+
+    keys = (
+        "t", "price", "imp", "expo", "load", "sun",
+        "sun_home", "batt_home", "other_home", "grid_home",
+        "chg_sun", "chg_grid", "mode",
+    )
+    series: dict[str, list[Any]] = {k: [] for k in keys}
+    has_storage = False
+    has_ev = False
+    other_kwh = 0.0
 
     for s in schedule:
-        t.append(s.get("t", ""))
-        price.append(float(s.get("import_price_eur_per_kwh", 0.0) or 0.0))
-        exp.append(float(s.get("export_price_eur_per_kwh", 0.0) or 0.0))
-        imp.append(max(0.0, float(s.get("grid_import_kw", 0.0) or 0.0)))
-        expo.append(max(0.0, float(s.get("grid_export_kw", 0.0) or 0.0)))
-        devices = s.get("devices", {}) or {}
-        pv.append(
-            round(
-                sum(
-                    max(0.0, float(d.get("kw", 0.0) or 0.0))
-                    for d in devices.values()
-                    if d.get("type") == "pv"
-                ),
-                4,
-            )
-        )
-        load.append(
-            round(
-                sum(
-                    max(0.0, -float(d.get("kw", 0.0) or 0.0))
-                    for d in devices.values()
-                    if d.get("type") in _LOAD_TYPES
-                ),
-                4,
-            )
-        )
+        f = _step_flows(s, soc, hybrid_cfg, step_h)
+        has_storage = has_storage or f["has_storage"]
+        has_ev = has_ev or f["has_ev"]
+        other_kwh += (f["other_src"] + f["other_load"]) * step_h
+        series["t"].append(s.get("t", ""))
+        series["price"].append(_num(s.get("import_price_eur_per_kwh")))
+        for k in keys[2:]:
+            if k in f:
+                series[k].append(round(f[k], 4) if isinstance(f[k], float) else f[k])
 
-    solve = (
-        inp.get("triggered_at_utc")
-        or inp.get("solve_time_utc")
-        or (t[0] if t else "")
+    solve = inp.get("triggered_at_utc") or inp.get("solve_time_utc") or (
+        series["t"][0] if series["t"] else ""
     )
     summary = {
         "solve": solve,
         "naive": eco.naive_cost_eur,
-        # Effective cost (after SOC terminal credit) is the honest "with plan"
-        # figure; saving = naive - effective, matching the economic metrics.
+        # Effective cost (after the SOC terminal credit) is the honest "with
+        # plan" figure; saving = naive - effective, as in the economic metrics.
         "opt": eco.effective_cost_eur,
         "saving": round(max(0.0, eco.saving_eur), 4),
+        "case": _cost_case(eco.naive_cost_eur, eco.effective_cost_eur, eco.saving_eur),
         "import": m.grid_import_kwh,
         "export": m.grid_export_kwh,
         "pv": m.pv_total_kwh,
         "load": m.load_total_kwh,
         "self": m.self_sufficiency_pct,
+        "has_storage": has_storage,
+        "has_ev": has_ev,
+        "other_kwh": round(other_kwh, 3),
     }
+    return {**series, "summary": summary}
+
+
+def _step_flows(
+    step: dict[str, Any],
+    soc: dict[str, float],
+    hybrid_cfg: dict[str, Any],
+    step_h: float,
+) -> dict[str, Any]:
+    """Read one step's devices into AC-side flows (kW) and a mode label.
+
+    ``soc`` carries each hybrid's state of charge from the previous step and is
+    updated in place, so callers must walk the schedule in order.
+    """
+    sun = 0.0          # sun delivered on the AC side (pv + hybrid DC panels)
+    sun_gen = 0.0      # all sun generated, including sun charging a hybrid's cell
+    batt = 0.0         # storage delivering to the house
+    other_src = 0.0    # unknown device types delivering power
+    load = 0.0         # everything the house consumes, the car included
+    other_load = 0.0   # the part of load from unknown device types
+    ac_charge = 0.0    # storage drawing AC power to charge
+    dc_solar = 0.0     # hybrid DC sun going straight into its cell
+    has_storage = False
+    has_ev = False
+
+    for name, d in (step.get("devices") or {}).items():
+        kind = d.get("type")
+        kw = _num(d.get("kw"))
+        if kind in _PV_TYPES:
+            sun += max(0.0, kw)
+            sun_gen += max(0.0, kw)
+        elif kind in _BATTERY_TYPES:
+            has_storage = True
+            batt += max(0.0, kw)
+            ac_charge += max(0.0, -kw)
+        elif kind in _HYBRID_TYPES:
+            has_storage = True
+            prev = soc.get(name, _num(d.get("soc_kwh")))
+            now = _num(d.get("soc_kwh"), prev)
+            soc[name] = now
+            h_sun, h_batt, h_charge, h_dc = _split_hybrid(
+                kw, prev, now, step_h, hybrid_cfg.get(name) or {}
+            )
+            sun += h_sun
+            sun_gen += h_sun + h_dc
+            batt += h_batt
+            ac_charge += h_charge
+            dc_solar += h_dc
+        elif kind in _EV_TYPES:
+            has_ev = True
+            load += max(0.0, -kw)
+            batt += max(0.0, kw)
+        elif kind in _LOAD_TYPES:
+            load += max(0.0, -kw)
+        else:
+            other_src += max(0.0, kw)
+            other_load += max(0.0, -kw)
+            load += max(0.0, -kw)
+
+    imp = max(0.0, _num(step.get("grid_import_kw")))
+    expo = max(0.0, _num(step.get("grid_export_kw")))
+
+    sun_home = min(sun, load)
+    batt_home = min(batt, load - sun_home)
+    other_home = min(other_src, load - sun_home - batt_home)
+    grid_home = max(0.0, load - sun_home - batt_home - other_home)
+    sun_to_charge = min(max(0.0, sun - sun_home), ac_charge)
+    chg_sun = sun_to_charge + dc_solar
+    chg_grid = max(0.0, min(ac_charge - sun_to_charge, imp - grid_home))
+
+    if batt_home > _MODE_THRESHOLD_KW:
+        mode = "battery"
+    elif chg_grid > _MODE_THRESHOLD_KW:
+        mode = "grid_charge"
+    elif chg_sun > _MODE_THRESHOLD_KW:
+        mode = "solar_charge"
+    elif load > 0.0 and grid_home <= _MODE_THRESHOLD_KW:
+        mode = "sun"
+    else:
+        mode = "grid"
+
     return {
-        "t": t,
-        "price": price,
-        "exp": exp,
-        "pv": pv,
-        "load": load,
         "imp": imp,
         "expo": expo,
-        "summary": summary,
+        "load": load,
+        "sun": sun_gen,
+        "sun_home": sun_home,
+        "batt_home": batt_home,
+        "other_home": other_home,
+        "grid_home": grid_home,
+        "chg_sun": chg_sun,
+        "chg_grid": chg_grid,
+        "mode": mode,
+        "other_src": other_src,
+        "other_load": other_load,
+        "has_storage": has_storage,
+        "has_ev": has_ev,
     }
+
+
+def _split_hybrid(
+    kw: float,
+    soc_prev: float,
+    soc_now: float,
+    step_h: float,
+    cfg: dict[str, Any],
+) -> tuple[float, float, float, float]:
+    """Split a hybrid inverter's AC ``kw`` into (sun, battery, ac_charge, dc_solar).
+
+    Uses only what the solver decided: the AC exchange and the planned SOC.
+    Energy leaving the cell (scaled by the configured discharge and inverter
+    efficiencies) is battery; the rest of the AC output is the hybrid's sun.
+    Cell energy gained beyond what the AC side delivered into it is its DC sun.
+    """
+    inv = _num(cfg.get("inverter_efficiency"), 1.0) or 1.0
+    eff_in = _num(cfg.get("battery_charge_efficiency"), 1.0) or 1.0
+    eff_out = _num(cfg.get("battery_discharge_efficiency"), 1.0) or 1.0
+    cell_kw = (soc_now - soc_prev) / step_h if step_h > 0 else 0.0
+    out_kw = max(0.0, kw)
+    ac_charge = max(0.0, -kw)
+    if cell_kw < 0:
+        batt = min(out_kw, -cell_kw * eff_out * inv)
+        return out_kw - batt, batt, ac_charge, 0.0
+    dc_solar = max(0.0, cell_kw - ac_charge * inv * eff_in)
+    return out_kw, 0.0, ac_charge, dc_solar
+
+
+def _cost_case(naive: float, opt: float, saving: float) -> str:
+    """Classify the day for wording: ``cost``, ``flip``, ``earn`` or ``none``.
+
+    ``cost``: the house pays and the plan pays less. ``flip``: the plan turns a
+    cost into income. ``earn``: the house earns money either way and the plan
+    earns more. ``none``: the plan adds nothing worth mentioning.
+    """
+    if saving <= _SAVING_THRESHOLD_EUR:
+        return "none"
+    if naive > 0 and opt >= 0:
+        return "cost"
+    if naive > 0:
+        return "flip"
+    return "earn"
+
+
+def _step_hours(schedule: list[dict[str, Any]]) -> float:
+    """Step length in hours from the schedule's own timestamps (default 15 min)."""
+    if len(schedule) >= 2:
+        try:
+            a = datetime.fromisoformat(schedule[0]["t"].replace("Z", "+00:00"))
+            b = datetime.fromisoformat(schedule[1]["t"].replace("Z", "+00:00"))
+            hours = (b - a).total_seconds() / 3600.0
+            if hours > 0:
+                return hours
+        except (KeyError, ValueError, AttributeError):
+            pass
+    return 0.25
+
+
+def _num(value: Any, default: float = 0.0) -> float:
+    """Coerce a dump value to float, treating missing/None as ``default``."""
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +368,10 @@ h2{font-family:var(--serif);font-weight:400;font-size:28px;margin:0 0 4px}
 .save .kicker{color:#BFE7E0}
 .save svg.deco{position:absolute;right:-40px;bottom:-40px;opacity:.13}
 .compare{margin-top:22px;display:grid;gap:10px}
-.cbar{display:grid;grid-template-columns:150px 1fr 70px;align-items:center;gap:12px;font-size:14px}
+.cbar{display:grid;grid-template-columns:150px 1fr 130px;align-items:center;gap:12px;font-size:14px}
 .cbar .track{height:14px;background:rgba(255,255,255,.12);border-radius:8px;overflow:hidden}
 .cbar .fill{height:100%;border-radius:8px;width:0;transition:width 1.2s cubic-bezier(.2,.7,.2,1)}
-.cbar .v{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.cbar .v{white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
 .now{display:flex;flex-direction:column;gap:14px}
 .now .state{display:flex;gap:16px;align-items:center}
 .icon{width:58px;height:58px;border-radius:18px;display:grid;place-items:center;flex-shrink:0}
@@ -223,7 +417,7 @@ section{margin-top:22px}
 .stat .l{font-size:13px;color:var(--soft);margin-top:4px;line-height:1.4}
 footer{margin-top:30px;color:var(--soft);font-size:12.5px;line-height:1.6;text-align:center}
 .wait{padding:70px 20px;text-align:center;color:var(--soft);font-family:var(--serif);font-size:24px}
-@media (max-width:860px){.hero,.two{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.steps li{grid-template-columns:86px 42px 1fr}.steps .pill{display:none}.cbar{grid-template-columns:110px 1fr 60px}}
+@media (max-width:860px){.hero,.two{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}.steps li{grid-template-columns:86px 42px 1fr}.steps .pill{display:none}.cbar{grid-template-columns:110px 1fr 110px}}
 </style>
 </head>
 <body>
@@ -281,9 +475,13 @@ const MODE = {
   solar_charge:{col:'#E39A1F',bg:'#FDEFD2',ic:'charge'}, sun:{col:'#F0A92E',bg:'#FDEFD2',ic:'sun'}, grid:{col:'#8A93A5',bg:'#E8EBF0',ic:'grid'}
 };
 const T = {
- nl:{title:'Wat doet ons huis <em>vandaag</em> met stroom?',saveK:'Besparing vandaag dankzij de thuisbatterij',
-  saveP:p=>`Door slim te laden als stroom goedkoop is en de batterij te gebruiken als stroom duur is, betalen we vandaag zo'n <b>${p}%</b> minder.`,
-  saveP0:`Door slim te laden als stroom goedkoop is en de batterij te gebruiken als stroom duur is, houden we vandaag een flink bedrag over.`,
+ nl:{title:'Wat doet ons huis <em>vandaag</em> met stroom?',saveK:'Besparing vandaag dankzij de thuisbatterij',saveKplan:'Besparing vandaag dankzij het slimme plan',gainK:b=>`Extra opgeleverd vandaag dankzij ${b?'de thuisbatterij':'het slimme plan'}`,
+  how:b=>b?'slim te laden als stroom goedkoop is en de batterij te gebruiken als stroom duur is':'apparaten op de goedkoopste momenten te laten draaien',
+  saveP:(p,h)=>`Door ${h}, betalen we vandaag zo'n <b>${p}%</b> minder.`,
+  saveFlip:h=>`Door ${h}, verdienen we vandaag geld in plaats van dat we betalen.`,
+  saveEarn:(e,h)=>`Onze zonnepanelen leveren vandaag geld op. Door ${h} verdienen we extra: in totaal <b>€ ${e}</b>.`,
+  saveNone:'Vandaag levert slim plannen niets extra op. We houden het simpel.',
+  pay:'betalen',earn:'verdienen',
   cb1:'Zonder slim plan',cb2:'Met slim plan',nowK:t=>`Nu, om ${t}`,nextPre:'Daarna',nextAt:'vanaf',
   planH:'Het plan voor de rest van de dag',planS:'Elke kleur is een stukje van de dag. Klik op een blok of een regel om te zien wat er gebeurt en waarom.',
   m:{battery:{a:'Huis draait op de batterij',b:c=>`Stroom is nu duur (rond ${c} cent). We gebruiken wat we eerder hebben opgeslagen.`},
@@ -297,14 +495,19 @@ const T = {
   tAvoid:(a,b,c)=>[`Liever niet: ${a} - ${b}`,`De duurste uren, tot ${c} cent per kWh. De batterij vangt dit zoveel mogelijk op.`],
   tSun:(a,b)=>[`Meeste zon: ${a} - ${b}`,`Dan maken de panelen het meeste stroom.`],
   flowH:'Waar komt onze stroom vandaan, per uur?',flowS:'Boven de lijn: wat het huis gebruikt en waar dat vandaan komt. Onder de lijn: stroom die de batterij in gaat.',
-  lg:{sun:'Zon',batt:'Batterij',grid:'Net',cs:'Batterij laden (zon)',cg:'Batterij laden (net)'},
+  lg:{sun:'Zon',batt:'Batterij',grid:'Net',oth:'Overig',cs:'Batterij laden (zon)',cg:'Batterij laden (net)'},
   srcH:'De dag in cijfers',srcS:'Alles opgeteld van nu tot het einde van de planning.',
   st:{use:'stroom die het huis gebruikt',sun:'opgewekt door de zonnepanelen',imp:'gekocht van het net',self:'van ons verbruik hoefden we niet te kopen'},
-  foot:(t,h)=>`Plan berekend om ${t} voor de komende ${h} uur. Bedragen zijn verwachtingen, de werkelijkheid kan iets afwijken.<br>Gemaakt door Mimirheim. Batterijstroom is afgeleid uit verbruik, zon en net.`,
+  foot:(t,h)=>`Plan berekend om ${t} voor de komende ${h} uur. Bedragen zijn verwachtingen, de werkelijkheid kan iets afwijken.<br>Alle cijfers komen rechtstreeks uit het plan van Mimirheim.`,
+  other:k=>`Inclusief ${k} kWh van apparaten die deze pagina niet apart toont.`,
   dateFmt:'nl-NL',wait:'Nog geen plan van Mimirheim.'},
- en:{title:'What is our house doing with <em>power</em> today?',saveK:'Saved today thanks to the home battery',
-  saveP:p=>`By charging when power is cheap and using the battery when it is expensive, we pay about <b>${p}%</b> less today.`,
-  saveP0:`By charging when power is cheap and using the battery when it is expensive, we come out a good amount ahead today.`,
+ en:{title:'What is our house doing with <em>power</em> today?',saveK:'Saved today thanks to the home battery',saveKplan:'Saved today thanks to the smart plan',gainK:b=>`Gained today thanks to ${b?'the home battery':'the smart plan'}`,
+  how:b=>b?'charging when power is cheap and using the battery when it is expensive':'running appliances at the cheapest moments',
+  saveP:(p,h)=>`By ${h}, we pay about <b>${p}%</b> less today.`,
+  saveFlip:h=>`By ${h}, we earn money today instead of paying.`,
+  saveEarn:(e,h)=>`Our solar panels earn money today. By ${h}, we earn extra: <b>€ ${e}</b> in total.`,
+  saveNone:'Smart planning does not add anything today, so we keep it simple.',
+  pay:'pay',earn:'earn',
   cb1:'Without smart plan',cb2:'With smart plan',nowK:t=>`Right now, at ${t}`,nextPre:'Next',nextAt:'from',
   planH:'The plan for the rest of the day',planS:'Each colour is a part of the day. Click a block or a row to see what happens and why.',
   m:{battery:{a:'House runs on the battery',b:c=>`Power is expensive now (around ${c} cents). We use what we stored earlier.`},
@@ -318,30 +521,21 @@ const T = {
   tAvoid:(a,b,c)=>[`Better avoid: ${a} - ${b}`,`The most expensive hours, up to ${c} cents per kWh. The battery covers as much as it can.`],
   tSun:(a,b)=>[`Most sunshine: ${a} - ${b}`,`When the panels make the most power.`],
   flowH:'Where does our power come from, hour by hour?',flowS:'Above the line: what the house uses and where it comes from. Below the line: power going into the battery.',
-  lg:{sun:'Sun',batt:'Battery',grid:'Grid',cs:'Battery charging (sun)',cg:'Battery charging (grid)'},
+  lg:{sun:'Sun',batt:'Battery',grid:'Grid',oth:'Other',cs:'Battery charging (sun)',cg:'Battery charging (grid)'},
   srcH:'The day in numbers',srcS:'Everything added up from now until the end of the plan.',
   st:{use:'power used by the house',sun:'made by the solar panels',imp:'bought from the grid',self:'of our usage we did not have to buy'},
-  foot:(t,h)=>`Plan calculated at ${t} for the next ${h} hours. Amounts are forecasts, reality may differ a little.<br>Made by Mimirheim. Battery flow is derived from usage, solar and grid.`,
+  foot:(t,h)=>`Plan calculated at ${t} for the next ${h} hours. Amounts are forecasts, reality may differ a little.<br>All numbers come straight from Mimirheim's plan.`,
+  other:k=>`Includes ${k} kWh from devices this page does not show separately.`,
   dateFmt:'en-GB',wait:'No plan from Mimirheim yet.'}
 };
 
 const N = D.t.length;
 let steps=[], blocks=[], endTime=null, solveT=null, pmin=0, pmax=0, wash=null, avoid=null, sunBest=null;
 function prep(){
-  steps = D.t.map((t,i)=>{
-    const P=D.pv[i], Ld=D.load[i], I=D.imp[i], E=D.expo[i];
-    const b=I-E-Ld+P;
-    const sunHome=Math.min(P,Ld);
-    const battHome=Math.min(Math.max(-b,0),Ld-sunHome);
-    const gridHome=Math.max(Ld-sunHome-battHome,0);
-    const chg=Math.max(b,0);
-    const chgSun=Math.min(Math.max(P-sunHome,0),chg);
-    const chgGrid=Math.max(chg-chgSun,0);
-    let m;
-    if(b<-0.03)m='battery';else if(chgGrid>0.03)m='grid_charge';else if(chgSun>0.03)m='solar_charge';
-    else if(I<0.01&&P>=Ld*0.9)m='sun';else if(I<0.01)m='battery';else m='grid';
-    return {t:new Date(t),price:D.price[i],P,Ld,I,b,sunHome,battHome,gridHome,chgSun,chgGrid,m};
-  });
+  // Every flow and mode comes from the server; this script only presents them.
+  steps = D.t.map((t,i)=>({t:new Date(t),price:D.price[i],Ld:D.load[i],
+    sunHome:D.sun_home[i],battHome:D.batt_home[i],otherHome:D.other_home[i],gridHome:D.grid_home[i],
+    chgSun:D.chg_sun[i],chgGrid:D.chg_grid[i],m:D.mode[i]}));
   for(let k=0;k<2;k++)for(let i=1;i<N-1;i++){if(steps[i].m!==steps[i-1].m&&steps[i].m!==steps[i+1].m&&steps[i].m!=='grid_charge')steps[i].m=steps[i-1].m;}
   blocks=[];
   steps.forEach((s,i)=>{const last=blocks[blocks.length-1];if(last&&last.m===s.m)last.end=i;else blocks.push({m:s.m,start:i,end:i});});
@@ -353,7 +547,7 @@ function prep(){
   const wb=(len,dir)=>{let best=null;for(let i=0;i+len<=N;i++){const a=D.price.slice(i,i+len).reduce((x,y)=>x+y,0)/len;if(best===null||dir*a<dir*best.a)best={i,a};}return best;};
   const wlen=Math.min(8,N);
   wash=wb(wlen,1);avoid=wb(wlen,-1);
-  sunBest=null;for(let i=0;i+wlen<=N;i++){const s=D.pv.slice(i,i+wlen).reduce((x,y)=>x+y,0);if(!sunBest||s>sunBest.s)sunBest={i,s};}
+  sunBest=null;for(let i=0;i+wlen<=N;i++){const s=D.sun.slice(i,i+wlen).reduce((x,y)=>x+y,0);if(!sunBest||s>sunBest.s)sunBest={i,s};}
 }
 const hm=d=>d.toLocaleTimeString(T[L].dateFmt,{hour:'2-digit',minute:'2-digit',timeZone:TZ});
 const hr=d=>+d.toLocaleString('en-GB',{hour:'2-digit',hour12:false,timeZone:TZ});
@@ -368,10 +562,21 @@ function render(){
   document.querySelectorAll('.lang button').forEach(b=>b.classList.toggle('on',b.dataset.l===L));
   document.getElementById('dateline').textContent=solveT.toLocaleDateString(t.dateFmt,{weekday:'long',day:'numeric',month:'long',timeZone:TZ});
   document.getElementById('title').innerHTML=t.title;
-  const s=D.summary,pct=s.naive>0?Math.round(s.saving/s.naive*100):0;
-  document.getElementById('saveK').textContent=t.saveK;document.getElementById('saveBig').innerHTML=`<small>€</small>${nf(s.saving,2)}`;document.getElementById('saveP').innerHTML=pct>0?t.saveP(pct):t.saveP0;
-  document.getElementById('cb1').textContent=t.cb1;document.getElementById('cb2').textContent=t.cb2;document.getElementById('v1').textContent=eur(s.naive);document.getElementById('v2').textContent=eur(s.opt);
-  requestAnimationFrame(()=>{document.getElementById('f1').style.width='100%';document.getElementById('f2').style.width=(s.naive>0?Math.max(0,Math.min(100,s.opt/s.naive*100)):0)+'%';});
+  const s=D.summary,how=t.how(s.has_storage);
+  document.getElementById('saveK').textContent=(s.case==='earn'||s.case==='flip')?t.gainK(s.has_storage):(s.has_storage?t.saveK:t.saveKplan);
+  document.getElementById('saveBig').innerHTML=`<small>€</small>${nf(s.saving,2)}`;
+  document.getElementById('saveP').innerHTML=
+    s.case==='cost'?t.saveP(Math.round(s.saving/s.naive*100),how):
+    s.case==='flip'?t.saveFlip(how):
+    s.case==='earn'?t.saveEarn(nf(-s.opt,2),how):t.saveNone;
+  // Never show a minus sign: say "pay" or "earn". Bars scale by size; colour says which.
+  const money=v=>`${v>0?t.pay:t.earn} € ${nf(Math.abs(v),2)}`;
+  const big=Math.max(Math.abs(s.naive),Math.abs(s.opt))||1;
+  const barW=(id,v)=>{document.getElementById(id).style.background=v>0?'#F2B9A3':'#9FE3CC';return Math.abs(v)/big*100;};
+  document.getElementById('cb1').textContent=t.cb1;document.getElementById('cb2').textContent=t.cb2;
+  document.getElementById('v1').textContent=money(s.naive);document.getElementById('v2').textContent=money(s.opt);
+  const w1=barW('f1',s.naive),w2=barW('f2',s.opt);
+  requestAnimationFrame(()=>{document.getElementById('f1').style.width=w1+'%';document.getElementById('f2').style.width=w2+'%';});
   const cur=blocks[0],nxt=blocks[1]||blocks[0],mc=MODE[cur.m],mn=MODE[nxt.m];
   document.getElementById('nowK').textContent=t.nowK(hm(solveT));
   document.getElementById('nowIcon').style.background=mc.bg;document.getElementById('nowIcon').innerHTML=IC[mc.ic](mc.col);
@@ -402,15 +607,16 @@ function render(){
   document.getElementById('priceH').textContent=t.priceH;document.getElementById('priceS').textContent=t.priceS;
   document.getElementById('flowH').textContent=t.flowH;document.getElementById('flowS').textContent=t.flowS;
   const lg=t.lg;
-  document.getElementById('flowLegend').innerHTML=[['var(--sun)',lg.sun],['var(--batt)',lg.batt],['var(--grid2)',lg.grid],['var(--sun2)',lg.cs],['#9DB7DE',lg.cg]].map(([c,n])=>`<span><i style="background:${c}"></i>${n}</span>`).join('')+`<span><i style="background:none;border-top:2px dashed var(--ink);border-radius:0;height:0;width:16px"></i>${L==='nl'?'Huisverbruik':'House usage'}</span>`;
+  const hasSt=D.summary.has_storage,hasOth=D.summary.other_kwh>0;
+  document.getElementById('flowLegend').innerHTML=[['var(--sun)',lg.sun,1],['var(--batt)',lg.batt,hasSt],['var(--grid2)',lg.grid,1],['#B7A99A',lg.oth,hasOth],['var(--sun2)',lg.cs,hasSt],['#9DB7DE',lg.cg,hasSt]].filter(x=>x[2]).map(([c,n])=>`<span><i style="background:${c}"></i>${n}</span>`).join('')+`<span><i style="background:none;border-top:2px dashed var(--ink);border-radius:0;height:0;width:16px"></i>${L==='nl'?'Huisverbruik':'House usage'}</span>`;
   document.getElementById('srcH').textContent=t.srcH;document.getElementById('srcS').textContent=t.srcS;
-  const sunT=steps.reduce((a,s)=>a+s.sunHome,0),battT=steps.reduce((a,s)=>a+s.battHome,0),gridT=steps.reduce((a,s)=>a+s.gridHome,0),tot=sunT+battT+gridT||1;
+  const sunT=steps.reduce((a,s)=>a+s.sunHome,0),battT=steps.reduce((a,s)=>a+s.battHome,0),gridT=steps.reduce((a,s)=>a+s.gridHome,0),othT=steps.reduce((a,s)=>a+s.otherHome,0),tot=sunT+battT+gridT+othT||1;
   const seg2=(v,c,n)=>`<div style="flex:${v};background:${c}">${v/tot>.12?`${n} ${Math.round(v/tot*100)}%`:''}</div>`;
-  document.getElementById('srcbar').innerHTML=seg2(sunT,'var(--sun)',lg.sun)+seg2(battT,'var(--batt)',lg.batt)+seg2(gridT,'var(--grid)',lg.grid);
+  document.getElementById('srcbar').innerHTML=seg2(sunT,'var(--sun)',lg.sun)+seg2(battT,'var(--batt)',lg.batt)+seg2(othT,'#B7A99A',lg.oth)+seg2(gridT,'var(--grid)',lg.grid);
   const stt=t.st;
   document.getElementById('stats').innerHTML=[[nf(s.load,1),'kWh',stt.use],[nf(s.pv,1),'kWh',stt.sun],[nf(s.import,1),'kWh',stt.imp],[nf(s.self,0),'%',stt.self]]
     .map(([n,u,l])=>`<div class="stat"><div class="n">${n}<small>${u}</small></div><div class="l">${l}</div></div>`).join('');
-  document.getElementById('foot').innerHTML=t.foot(hm(solveT),nf((endTime-steps[0].t)/36e5,0));
+  document.getElementById('foot').innerHTML=t.foot(hm(solveT),nf((endTime-steps[0].t)/36e5,0))+(D.summary.other_kwh>0?'<br>'+t.other(nf(D.summary.other_kwh,1)):'');
   drawPrice();drawFlow();
 }
 
@@ -442,18 +648,18 @@ function drawPrice(){
 function drawFlow(){
   const box=document.getElementById('flowChart'),tip=box.querySelector('.tip');box.querySelectorAll('svg').forEach(e=>e.remove());
   const H={},order=[];
-  steps.forEach(s=>{const k=hr(s.t);if(!(k in H)){H[k]={h:k,sun:0,batt:0,grid:0,cs:0,cg:0,use:0,price:0,n:0};order.push(k);}const o=H[k];o.sun+=s.sunHome;o.batt+=s.battHome;o.grid+=s.gridHome;o.cs+=s.chgSun;o.cg+=s.chgGrid;o.use+=s.Ld;o.price+=s.price;o.n++;});
+  steps.forEach(s=>{const k=hr(s.t);if(!(k in H)){H[k]={h:k,sun:0,batt:0,oth:0,grid:0,cs:0,cg:0,use:0,price:0,n:0};order.push(k);}const o=H[k];o.sun+=s.sunHome;o.batt+=s.battHome;o.oth+=s.otherHome;o.grid+=s.gridHome;o.cs+=s.chgSun;o.cg+=s.chgGrid;o.use+=s.Ld;o.price+=s.price;o.n++;});
   const hrs=order.map(k=>H[k]);
-  hrs.forEach(o=>{o.sun*=0.25;o.batt*=0.25;o.grid*=0.25;o.cs*=0.25;o.cg*=0.25;o.use*=0.25;});
+  hrs.forEach(o=>{o.sun*=0.25;o.batt*=0.25;o.oth*=0.25;o.grid*=0.25;o.cs*=0.25;o.cg*=0.25;o.use*=0.25;});
   const W=box.clientWidth||600,Ht=320,ml=40,mr=10,mt=16,mb=30;
-  const up=Math.max(...hrs.map(o=>o.sun+o.batt+o.grid),0.1),dn=Math.max(...hrs.map(o=>o.cs+o.cg),0.1);
+  const up=Math.max(...hrs.map(o=>o.sun+o.batt+o.oth+o.grid),0.1),dn=Math.max(...hrs.map(o=>o.cs+o.cg),0.1);
   const top=Math.ceil(up*4)/4,bot=Math.ceil(dn*4)/4,y=v=>mt+(top-v)/((top+bot)||1)*(Ht-mt-mb);
   const bw=(W-ml-mr)/hrs.length,pad=Math.max(3,bw*.18);let g='';
   for(let v=-bot;v<=top+1e-9;v+=0.25){g+=`<line x1="${ml}" x2="${W-mr}" y1="${y(v)}" y2="${y(v)}" stroke="${v===0?'#B9AE9A':'#EFE6D6'}" ${v===0?'stroke-width="1.5"':''}/>`;if(Math.abs(v*2-Math.round(v*2))<1e-6)g+=`<text x="${ml-6}" y="${y(v)+4}" text-anchor="end" font-size="11" fill="#8B8578">${nf(Math.abs(v),1)}</text>`;}
   g+=`<text x="${ml-6}" y="${mt-4}" text-anchor="end" font-size="11" fill="#8B8578">kWh</text>`;
   const rect=(x0,v0,v1,c,r)=>{const a=y(Math.max(v0,v1)),b=y(Math.min(v0,v1));return b-a<0.5?'':`<rect x="${x0}" y="${a}" width="${bw-2*pad}" height="${b-a}" fill="${c}" rx="${r}"/>`;};
   let linePts=[];
-  hrs.forEach((o,i)=>{const x0=ml+i*bw+pad;let acc=0;g+=rect(x0,acc,acc+=o.sun,'#F0A92E',2);g+=rect(x0,acc,acc+=o.batt,'#2E8C80',2);g+=rect(x0,acc,acc+=o.grid,'#C9CFDA',2);
+  hrs.forEach((o,i)=>{const x0=ml+i*bw+pad;let acc=0;g+=rect(x0,acc,acc+=o.sun,'#F0A92E',2);g+=rect(x0,acc,acc+=o.batt,'#2E8C80',2);g+=rect(x0,acc,acc+=o.oth,'#B7A99A',2);g+=rect(x0,acc,acc+=o.grid,'#C9CFDA',2);
     let d=0;g+=rect(x0,d,d-=o.cs,'#FFD27A',2);g+=rect(x0,d,d-=o.cg,'#9DB7DE',2);linePts.push([ml+i*bw+bw/2,y(o.use)]);
     g+=`<text x="${ml+i*bw+bw/2}" y="${Ht-10}" text-anchor="middle" font-size="11" fill="#8B8578">${String(o.h).padStart(2,'0')}${bw>40?':00':''}</text>`;});
   g+=`<polyline points="${linePts.map(p=>p.join(',')).join(' ')}" fill="none" stroke="#1E2733" stroke-width="1.6" stroke-dasharray="4 4"/><rect id="fhl" y="${mt}" height="${Ht-mt-mb}" width="${bw}" fill="#1E2733" opacity="0" rx="8"/><rect x="${ml}" y="0" width="${W-ml-mr}" height="${Ht}" fill="transparent" id="fhit"/>`;
@@ -462,8 +668,8 @@ function drawFlow(){
   hit.onmousemove=e=>{const r=box.getBoundingClientRect();const i=Math.max(0,Math.min(hrs.length-1,Math.floor((e.clientX-r.left-ml)/bw)));const o=hrs[i];
     hl.setAttribute('x',ml+i*bw);hl.setAttribute('opacity',.05);
     const row=(c,n,v)=>v>0.005?`<span style="color:${c}">■</span> ${n}: ${nf(v,2)} kWh<br>`:'';
-    tip.innerHTML=`<b>${String(o.h).padStart(2,'0')}:00 - ${String((o.h+1)%24).padStart(2,'0')}:00</b> · ${cents(o.price/o.n)} ${T[L].cent}<br>`+row('#F0A92E',lg.sun,o.sun)+row('#5FC2B4',lg.batt,o.batt)+row('#C9CFDA',lg.grid,o.grid)+row('#FFD27A',lg.cs,o.cs)+row('#9DB7DE',lg.cg,o.cg);
-    tip.style.left=Math.min(Math.max(ml+i*bw+bw/2,110),W-110)+'px';tip.style.top=(y(Math.max(o.sun+o.batt+o.grid,o.use))-6)+'px';tip.style.opacity=1;};
+    tip.innerHTML=`<b>${String(o.h).padStart(2,'0')}:00 - ${String((o.h+1)%24).padStart(2,'0')}:00</b> · ${cents(o.price/o.n)} ${T[L].cent}<br>`+row('#F0A92E',lg.sun,o.sun)+row('#5FC2B4',lg.batt,o.batt)+row('#B7A99A',lg.oth,o.oth)+row('#C9CFDA',lg.grid,o.grid)+row('#FFD27A',lg.cs,o.cs)+row('#9DB7DE',lg.cg,o.cg);
+    tip.style.left=Math.min(Math.max(ml+i*bw+bw/2,110),W-110)+'px';tip.style.top=(y(Math.max(o.sun+o.batt+o.oth+o.grid,o.use))-6)+'px';tip.style.opacity=1;};
   hit.onmouseleave=()=>{tip.style.opacity=0;hl.setAttribute('opacity',0);};
 }
 
