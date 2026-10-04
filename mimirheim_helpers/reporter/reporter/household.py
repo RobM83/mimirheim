@@ -123,13 +123,11 @@ def _build_payload(inp: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
     )
     series: dict[str, list[Any]] = {k: [] for k in keys}
     has_storage = False
-    has_ev = False
     other_kwh = 0.0
 
     for s in schedule:
         f = _step_flows(s, soc, hybrid_cfg, step_h)
         has_storage = has_storage or f["has_storage"]
-        has_ev = has_ev or f["has_ev"]
         other_kwh += (f["other_src"] + f["other_load"]) * step_h
         series["t"].append(s.get("t", ""))
         series["price"].append(_num(s.get("import_price_eur_per_kwh")))
@@ -154,7 +152,6 @@ def _build_payload(inp: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
         "load": m.load_total_kwh,
         "self": m.self_sufficiency_pct,
         "has_storage": has_storage,
-        "has_ev": has_ev,
         "other_kwh": round(other_kwh, 3),
     }
     return {**series, "summary": summary}
@@ -180,7 +177,6 @@ def _step_flows(
     ac_charge = 0.0    # storage drawing AC power to charge
     dc_solar = 0.0     # hybrid DC sun going straight into its cell
     has_storage = False
-    has_ev = False
 
     for name, d in (step.get("devices") or {}).items():
         kind = d.get("type")
@@ -206,7 +202,6 @@ def _step_flows(
             ac_charge += h_charge
             dc_solar += h_dc
         elif kind in _EV_TYPES:
-            has_ev = True
             load += max(0.0, -kw)
             batt += max(0.0, kw)
         elif kind in _LOAD_TYPES:
@@ -253,7 +248,6 @@ def _step_flows(
         "other_src": other_src,
         "other_load": other_load,
         "has_storage": has_storage,
-        "has_ev": has_ev,
     }
 
 
