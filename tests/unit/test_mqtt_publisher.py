@@ -21,7 +21,8 @@ from mimirheim.config.schema import (
     OutputsConfig,
 )
 from mimirheim.core.bundle import DeviceSetpoint, ScheduleStep, SolveResult
-from mimirheim.io.mqtt_publisher import MqttPublisher
+from mimirheim.io.mqtt_publisher import _LOAD_TYPES, MqttPublisher
+from reporter.metrics import _LOAD_TYPES as REPORTER_LOAD_TYPES
 
 
 def _seg() -> EfficiencySegment:
@@ -1903,3 +1904,69 @@ def test_a_stale_payload_is_dropped_rather_than_part_corrected() -> None:
     payload = json.loads(sent[0].args[1])
     assert payload["floor_kwh"] == 0.0
     assert payload["full_target_kwh"] is None
+
+
+@pytest.mark.parametrize(
+    "load_type", ["ev_charger", "thermal_boiler", "space_heating_hp", "combi_heat_pump"]
+)
+def test_last_solve_status_self_sufficiency_counts_every_consuming_type(
+    load_type: str,
+) -> None:
+    """An EV or heat-pump house is not reported as having no load.
+
+    1 kW consumed with 0.5 kW imported in each step: half served locally.
+    """
+    mock_client = MagicMock()
+    publisher = MqttPublisher(client=mock_client, config=_make_config())
+    step = {"grid_import_kw": 0.5, "grid_export_kw": 0.0,
+            "devices": {"dev": DeviceSetpoint(kw=-1.0, type=load_type)}}
+    result = SolveResult(
+        strategy="minimize_cost",
+        objective_value=0.5,
+        solve_status="optimal",
+        schedule=[ScheduleStep(t=0, **step), ScheduleStep(t=1, **step)],
+    )
+
+    publisher.publish_last_solve_status(result=result, error=None)
+
+    payload = json.loads(next(
+        c.args[1] for c in mock_client.publish.call_args_list
+        if c.args[0] == "mimir/status/last_solve"
+    ))
+    assert payload["self_sufficiency_pct"] == pytest.approx(50.0, abs=1e-4)
+
+
+def test_last_solve_status_ev_discharge_is_not_load() -> None:
+    """Vehicle-to-home (positive kw) does not count as house load."""
+    mock_client = MagicMock()
+    publisher = MqttPublisher(client=mock_client, config=_make_config())
+    result = SolveResult(
+        strategy="minimize_cost",
+        objective_value=0.5,
+        solve_status="optimal",
+        schedule=[ScheduleStep(
+            t=0, grid_import_kw=1.0, grid_export_kw=0.0,
+            devices={
+                "car": DeviceSetpoint(kw=2.0, type="ev_charger"),
+                "load": DeviceSetpoint(kw=-1.0, type="static_load"),
+            },
+        )],
+    )
+
+    publisher.publish_last_solve_status(result=result, error=None)
+
+    payload = json.loads(next(
+        c.args[1] for c in mock_client.publish.call_args_list
+        if c.args[0] == "mimir/status/last_solve"
+    ))
+    # Only the 1 kW static load counts, and it is all imported.
+    assert payload["self_sufficiency_pct"] == pytest.approx(0.0, abs=1e-4)
+
+
+def test_published_load_types_match_the_reporter() -> None:
+    """Core and reporter count the same device types as house load.
+
+    The published self_sufficiency_pct and the reports' figure must agree;
+    this keeps the two lists from drifting apart.
+    """
+    assert _LOAD_TYPES == REPORTER_LOAD_TYPES

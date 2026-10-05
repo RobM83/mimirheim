@@ -38,6 +38,21 @@ logger = logging.getLogger("mimirheim.publisher")
 
 _STEP_HOURS: float = 15 / 60.0
 
+# Device types whose negative ``kw`` is energy the house consumes. Kept in step
+# with ``_LOAD_TYPES`` in the reporter's ``metrics.py`` so the published
+# self-sufficiency and the reports agree. Batteries and hybrid inverters are
+# storage, not load.
+_LOAD_TYPES = frozenset(
+    {
+        "static_load",
+        "deferrable_load",
+        "ev_charger",
+        "thermal_boiler",
+        "space_heating_hp",
+        "combi_heat_pump",
+    }
+)
+
 
 def _schedule_summary(schedule: list[ScheduleStep]) -> dict[str, float]:
     """Compute grid and self-sufficiency metrics from a solved schedule.
@@ -54,7 +69,7 @@ def _schedule_summary(schedule: list[ScheduleStep]) -> dict[str, float]:
     load_total_kwh = 0.0
     for step in schedule:
         for setpoint in step.devices.values():
-            if setpoint.type in ("static_load", "deferrable_load"):
+            if setpoint.type in _LOAD_TYPES:
                 load_total_kwh += max(0.0, -setpoint.kw) * _STEP_HOURS
 
     load_served_local = max(0.0, load_total_kwh - grid_import_kwh)

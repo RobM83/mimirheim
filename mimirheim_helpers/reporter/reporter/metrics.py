@@ -40,7 +40,8 @@ class ScheduleMetrics:
         grid_import_kwh: Total energy imported from the grid over the horizon.
         grid_export_kwh: Total energy exported to the grid over the horizon.
         pv_total_kwh: Total PV generation over the horizon.
-        load_total_kwh: Total energy consumed by static and deferrable loads.
+        load_total_kwh: Total energy consumed by the house: every consuming
+            device type (see ``_LOAD_TYPES``), the EV while charging included.
         self_consumption_kwh: PV energy consumed locally (not exported).
         self_consumption_pct: Fraction of PV generation consumed locally,
             as a percentage. Zero when there is no PV generation.
@@ -56,6 +57,21 @@ class ScheduleMetrics:
     self_consumption_kwh: float
     self_consumption_pct: float
     self_sufficiency_pct: float
+
+
+# Device types whose negative ``kw`` is energy the house consumes. Kept in
+# step with ``_LOAD_TYPES`` in ``mimirheim.io.mqtt_publisher`` so the published
+# self-sufficiency and the reports agree.
+_LOAD_TYPES = frozenset(
+    {
+        "static_load",
+        "deferrable_load",
+        "ev_charger",
+        "thermal_boiler",
+        "space_heating_hp",
+        "combi_heat_pump",
+    }
+)
 
 
 def compute_schedule_metrics(schedule: list[dict[str, Any]]) -> ScheduleMetrics:
@@ -81,9 +97,11 @@ def compute_schedule_metrics(schedule: list[dict[str, Any]]) -> ScheduleMetrics:
         - Positive: device is producing power (PV generation, V2H discharge).
         - Negative: device is consuming power (battery charging, load draw).
 
-    Load devices (``static_load``, ``deferrable_load``) therefore have
-    **negative** ``kw`` values. This function negates them before summing to
-    produce positive kWh consumed.
+    Load is the negated ``kw`` of every consuming device type: static and
+    deferrable loads, EV chargers while charging, and the thermal device types
+    (boiler, space-heating and combi heat pumps). A vehicle-to-home discharge
+    (positive ``kw`` on an EV charger) is not load, and batteries and hybrid
+    inverters are storage, not load.
 
     Args:
         schedule: List of schedule step dicts from a ``SolveResult`` dump.
@@ -108,12 +126,13 @@ def compute_schedule_metrics(schedule: list[dict[str, Any]]) -> ScheduleMetrics:
 
     # Load consumption: load device kw is negative (consuming); negate to get
     # positive kWh. Using max(0.0, -kw) guards against any unexpected positive
-    # values on a load device without silently distorting the total.
+    # values on a load device without silently distorting the total, and keeps
+    # a vehicle-to-home EV discharge out of the load.
     load_total_kwh = sum(
         max(0.0, -sp.get("kw", 0.0)) * _STEP_HOURS
         for s in schedule
         for sp in s.get("devices", {}).values()
-        if sp.get("type") in ("static_load", "deferrable_load")
+        if sp.get("type") in _LOAD_TYPES
     )
 
     # Self-consumption: PV energy not exported (consumed locally).
