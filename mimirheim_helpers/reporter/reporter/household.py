@@ -29,12 +29,12 @@ keeps the arithmetic true by construction:
     ``battery``             Storage. Positive ``kw`` is discharge to the house,
                             negative is charging.
     ``hybrid_inverter``     Storage with its own DC panels behind one AC output.
-                            Its AC ``kw`` is split into sun and battery using the
-                            solver's planned SOC for that step and the device's
-                            configured efficiencies: energy leaving the cell is
-                            battery, the rest of the AC output is its sun; a
-                            rising SOC while the AC side is not drawing power is
-                            its sun charging the battery.
+                            Its AC ``kw`` is split into sun and battery by
+                            ``metrics.hybrid_splits``, from the planned SOC and
+                            the configured efficiencies, the same split the
+                            technical report uses. House flows use the AC side of
+                            that split; sun generated and sun charging the
+                            battery are DC at the MPPT input.
     ``ev_charger``          Consumption while charging (part of house usage,
                             never "the battery filling up"); a positive ``kw``
                             (vehicle-to-home) counts as battery.
@@ -61,7 +61,12 @@ import json
 from datetime import datetime
 from typing import Any
 
-from reporter.metrics import compute_economic_metrics, compute_schedule_metrics
+from reporter.metrics import (
+    HybridSplit,
+    compute_economic_metrics,
+    compute_schedule_metrics,
+    hybrid_splits,
+)
 
 _PV_TYPES = frozenset({"pv"})
 _BATTERY_TYPES = frozenset({"battery"})
@@ -107,14 +112,9 @@ def _build_payload(inp: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
     """Read every step's devices into explicit per-step flows plus a summary."""
     schedule = out.get("schedule", []) or []
     eco = compute_economic_metrics(out)
-    m = compute_schedule_metrics(schedule)
+    m = compute_schedule_metrics(schedule, inp)
     step_h = _step_hours(schedule)
-
-    hybrid_cfg = (inp.get("config") or {}).get("hybrid_inverters") or {}
-    soc: dict[str, float] = {
-        name: float(v.get("soc_kwh", 0.0) or 0.0)
-        for name, v in (inp.get("hybrid_inverter_inputs") or {}).items()
-    }
+    splits = hybrid_splits(schedule, inp)
 
     keys = (
         "t", "price", "imp", "expo", "load", "sun",
@@ -125,8 +125,8 @@ def _build_payload(inp: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
     has_storage = False
     other_kwh = 0.0
 
-    for s in schedule:
-        f = _step_flows(s, soc, hybrid_cfg, step_h)
+    for s, hybrids in zip(schedule, splits, strict=True):
+        f = _step_flows(s, hybrids)
         has_storage = has_storage or f["has_storage"]
         other_kwh += (f["other_src"] + f["other_load"]) * step_h
         series["t"].append(s.get("t", ""))
@@ -159,23 +159,21 @@ def _build_payload(inp: dict[str, Any], out: dict[str, Any]) -> dict[str, Any]:
 
 def _step_flows(
     step: dict[str, Any],
-    soc: dict[str, float],
-    hybrid_cfg: dict[str, Any],
-    step_h: float,
+    hybrids: dict[str, HybridSplit],
 ) -> dict[str, Any]:
     """Read one step's devices into AC-side flows (kW) and a mode label.
 
-    ``soc`` carries each hybrid's state of charge from the previous step and is
-    updated in place, so callers must walk the schedule in order.
+    ``hybrids`` is this step's split of each hybrid inverter, from
+    ``metrics.hybrid_splits``.
     """
-    sun = 0.0          # sun delivered on the AC side (pv + hybrid DC panels)
-    sun_gen = 0.0      # all sun generated, including sun charging a hybrid's cell
+    sun = 0.0          # sun delivered on the AC side (pv + hybrid panels)
+    sun_gen = 0.0      # all sun generated (hybrid sun as DC at the MPPT input)
     batt = 0.0         # storage delivering to the house
     other_src = 0.0    # unknown device types delivering power
     load = 0.0         # everything the house consumes, the car included
     other_load = 0.0   # the part of load from unknown device types
     ac_charge = 0.0    # storage drawing AC power to charge
-    dc_solar = 0.0     # hybrid DC sun going straight into its cell
+    dc_solar = 0.0     # hybrid sun going straight into its cell (DC)
     has_storage = False
 
     for name, d in (step.get("devices") or {}).items():
@@ -190,17 +188,12 @@ def _step_flows(
             ac_charge += max(0.0, -kw)
         elif kind in _HYBRID_TYPES:
             has_storage = True
-            prev = soc.get(name, _num(d.get("soc_kwh")))
-            now = _num(d.get("soc_kwh"), prev)
-            soc[name] = now
-            h_sun, h_batt, h_charge, h_dc = _split_hybrid(
-                kw, prev, now, step_h, hybrid_cfg.get(name) or {}
-            )
-            sun += h_sun
-            sun_gen += h_sun + h_dc
-            batt += h_batt
-            ac_charge += h_charge
-            dc_solar += h_dc
+            h = hybrids[name]
+            sun += h.pv_ac_kw
+            sun_gen += h.pv_dc_kw
+            batt += h.battery_ac_kw
+            ac_charge += h.ac_charge_kw
+            dc_solar += h.pv_to_cell_kw
         elif kind in _EV_TYPES:
             load += max(0.0, -kw)
             batt += max(0.0, kw)
@@ -249,33 +242,6 @@ def _step_flows(
         "other_load": other_load,
         "has_storage": has_storage,
     }
-
-
-def _split_hybrid(
-    kw: float,
-    soc_prev: float,
-    soc_now: float,
-    step_h: float,
-    cfg: dict[str, Any],
-) -> tuple[float, float, float, float]:
-    """Split a hybrid inverter's AC ``kw`` into (sun, battery, ac_charge, dc_solar).
-
-    Uses only what the solver decided: the AC exchange and the planned SOC.
-    Energy leaving the cell (scaled by the configured discharge and inverter
-    efficiencies) is battery; the rest of the AC output is the hybrid's sun.
-    Cell energy gained beyond what the AC side delivered into it is its DC sun.
-    """
-    inv = _num(cfg.get("inverter_efficiency"), 1.0) or 1.0
-    eff_in = _num(cfg.get("battery_charge_efficiency"), 1.0) or 1.0
-    eff_out = _num(cfg.get("battery_discharge_efficiency"), 1.0) or 1.0
-    cell_kw = (soc_now - soc_prev) / step_h if step_h > 0 else 0.0
-    out_kw = max(0.0, kw)
-    ac_charge = max(0.0, -kw)
-    if cell_kw < 0:
-        batt = min(out_kw, -cell_kw * eff_out * inv)
-        return out_kw - batt, batt, ac_charge, 0.0
-    dc_solar = max(0.0, cell_kw - ac_charge * inv * eff_in)
-    return out_kw, 0.0, ac_charge, dc_solar
 
 
 def _cost_case(naive: float, opt: float, saving: float) -> str:

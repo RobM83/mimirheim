@@ -462,7 +462,7 @@ def _render_summary_html(inp: dict, out: dict, schedule: list[dict]) -> str:
     horizon_h = n_steps * STEP_HOURS
     dispatch_sup = bool(out.get("dispatch_suppressed", False))
 
-    m = compute_schedule_metrics(schedule)
+    m = compute_schedule_metrics(schedule, inp)
     total_import = m.grid_import_kwh
     total_export = m.grid_export_kwh
     pv_kwh = m.pv_total_kwh
