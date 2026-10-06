@@ -31,6 +31,8 @@ import json
 import logging
 from pathlib import Path
 
+from reporter.metrics import compute_schedule_metrics
+
 logger = logging.getLogger(__name__)
 
 _INVENTORY_FILENAME = "inventory.js"
@@ -113,18 +115,9 @@ def _build_entry(
         s.get("grid_export_kw", 0.0) * _STEP_HOURS for s in schedule
     )
 
-    load_total_kwh = sum(
-        max(0.0, -sp.get("kw", 0.0)) * _STEP_HOURS
-        for s in schedule
-        for sp in s.get("devices", {}).values()
-        if sp.get("type") in ("static_load", "deferrable_load")
-    )
-    load_served_local = max(0.0, load_total_kwh - total_import_kwh)
-    self_suf_pct = (
-        round(load_served_local / load_total_kwh * 100.0, 1)
-        if load_total_kwh > 0.0
-        else 0.0
-    )
+    # Same definition of house load as the reports, so the index and the
+    # report it links to agree on self-sufficiency.
+    self_suf_pct = compute_schedule_metrics(schedule).self_sufficiency_pct
 
     # Derive the dump filenames from the report filename. The stem before
     # "_report.html" is the safe_ts used for all three files in the dump pair.
