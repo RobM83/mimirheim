@@ -683,7 +683,8 @@ class SolveResult(BaseModel):
             ``sum(grid_import[t] * import_price[t] * dt - grid_export[t] * export_price[t] * dt)``.
             Zero for infeasible solves.
         soc_credit_eur: Estimated future value in EUR of the net change in
-            stored energy across all batteries and EVs over the horizon.
+            stored energy across all batteries, EVs and hybrid inverters over
+            the horizon.
             Positive when the horizon ends with more energy stored than it
             started with. Computed as
             ``avg_import_price × soc_delta_cell_kwh × avg_discharge_eff``

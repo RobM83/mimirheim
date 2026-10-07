@@ -951,6 +951,17 @@ def _compute_soc_credit(
     directly comparable with ``optimised_cost_eur``, which is also an AC-side
     cash flow.
 
+    A hybrid inverter's AC ``kw`` cannot be used this way: it is the net of
+    its own panels and its battery, so solar passed straight through to the
+    house would count as energy drained from the cell. For a hybrid inverter
+    the change is therefore read from the cell itself, starting SOC to the
+    last step's ``soc_kwh``, and priced on the way out through the battery's
+    discharge efficiency and the inverter:
+
+        delta_kwh = soc_kwh[T-1] - initial_soc_kwh
+        soc_credit += avg_import_price * delta_kwh
+                      * battery_discharge_efficiency * inverter_efficiency
+
     A positive credit means the horizon ends with more stored energy than it
     started with. Subtract from ``optimised_cost_eur`` for a fair comparison
     against ``naive_cost_eur``.
@@ -999,6 +1010,20 @@ def _compute_soc_credit(
             if name in step.devices
         )
         credit += avg_import_price * soc_delta * discharge_eff
+
+    for name, inputs in bundle.hybrid_inverter_inputs.items():
+        hi_cfg = config.hybrid_inverters.get(name)
+        last = schedule[-1].devices.get(name)
+        # Without a terminal SOC there is no change to value. soc_kwh is
+        # optional on DeviceSetpoint, and schedules from older builds lack it.
+        if hi_cfg is None or last is None or last.soc_kwh is None:
+            continue
+        credit += (
+            avg_import_price
+            * (last.soc_kwh - inputs.soc_kwh)
+            * hi_cfg.battery_discharge_efficiency
+            * hi_cfg.inverter_efficiency
+        )
 
     return credit
 
