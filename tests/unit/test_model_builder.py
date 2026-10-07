@@ -224,6 +224,81 @@ def test_naive_cost_of_a_staged_array_stops_at_the_highest_register() -> None:
     assert result.naive_cost_eur == pytest.approx(0.75, abs=1e-9)
 
 
+def _hybrid_naive_cost(*, hybrid_pv_kw: float, roof_pv_kw: float | None = None) -> float:
+    """Solve four steps of a 3 kW load with one hybrid inverter and return
+    the naive baseline. Import 0.25 EUR/kWh, export 0.10 EUR/kWh.
+
+    The hybrid's panels peak at 4 kW behind a 0.96 inverter. A plain 1 kW
+    roof array is added when ``roof_pv_kw`` is given. The hybrid's forecast
+    runs two steps past the horizon, as a published one may: only the
+    horizon's steps may count.
+    """
+    horizon = 4
+    raw = {
+        "mqtt": {"host": "localhost", "client_id": "test"},
+        "grid": {"import_limit_kw": 20.0, "export_limit_kw": 20.0},
+        "hybrid_inverters": {
+            "hi": {
+                "capacity_kwh": 10.0,
+                "max_charge_kw": 4.0,
+                "max_discharge_kw": 4.0,
+                "max_pv_kw": 4.0,
+                "inverter_efficiency": 0.96,
+            },
+        },
+        "static_loads": {"base": {}},
+    }
+    pv_forecasts = {}
+    if roof_pv_kw is not None:
+        raw["pv_arrays"] = {"roof": {"max_power_kw": 1.0}}
+        pv_forecasts = {"roof": [roof_pv_kw] * horizon}
+    bundle = SolveBundle(
+        solve_time_utc=datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+        horizon_prices=[0.25] * horizon,
+        horizon_export_prices=[0.10] * horizon,
+        horizon_confidence=[1.0] * horizon,
+        pv_forecast=[roof_pv_kw or 0.0] * horizon,
+        base_load_forecast=[3.0] * horizon,
+        pv_forecasts=pv_forecasts,
+        hybrid_inverter_inputs={
+            "hi": HybridInverterInputs(soc_kwh=5.0, pv_forecast_kw=[hybrid_pv_kw] * (horizon + 2)),
+        },
+    )
+    return build_and_solve(bundle, MimirheimConfig.model_validate(raw)).naive_cost_eur
+
+
+def test_naive_cost_counts_a_hybrid_inverters_own_panels() -> None:
+    """Without storage dispatch a hybrid's panels still feed the house.
+
+    2.0 kW of panels through the 0.96 inverter cover 1.92 kW of the 3.0 kW
+    load, leaving 1.08 kW to import each step:
+    1.08 kW x 0.25 h x 0.25 EUR/kWh x 4 steps = 0.27 EUR.
+
+    Leaving the panels out would price the whole load, 0.75 EUR, and credit
+    the plan with saving what the panels produce on their own.
+    """
+    assert _hybrid_naive_cost(hybrid_pv_kw=2.0) == pytest.approx(0.27, abs=1e-9)
+
+
+def test_naive_cost_clips_a_hybrid_inverters_panels_to_max_pv_kw() -> None:
+    """A forecast above max_pv_kw delivers only max_pv_kw, after the inverter.
+
+    6.0 kW forecast against a 4.0 kW MPPT: 3.84 kW AC against a 3.0 kW load
+    exports 0.84 kW each step at 0.10 EUR/kWh:
+    -0.84 kW x 0.25 h x 0.10 EUR/kWh x 4 steps = -0.084 EUR.
+    """
+    assert _hybrid_naive_cost(hybrid_pv_kw=6.0) == pytest.approx(-0.084, abs=1e-9)
+
+
+def test_naive_cost_adds_a_hybrid_inverters_panels_to_the_arrays() -> None:
+    """Array and hybrid panels add up, each clipped to its own ceiling.
+
+    Roof forecast 1.5 kW on a 1.0 kW array, hybrid 1.0 kW through 0.96:
+    3.0 - 1.0 - 0.96 = 1.04 kW import, x 0.25 h x 0.25 EUR/kWh x 4 = 0.26 EUR.
+    """
+    assert _hybrid_naive_cost(hybrid_pv_kw=1.0, roof_pv_kw=1.5) == pytest.approx(0.26, abs=1e-9)
+
+
 def test_a_degraded_objective_is_reported_on_the_result() -> None:
     """build_and_solve must copy the builder's flag onto the SolveResult.
 

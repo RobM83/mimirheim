@@ -417,11 +417,12 @@ def build_and_solve(bundle: SolveBundle, config: MimirheimConfig) -> SolveResult
             f"{sorted(config.pv_arrays)!r}."
         )
 
-    # Sum of what the arrays can actually produce, accumulated below. The
-    # naive-cost baseline uses this rather than bundle.pv_forecast so that the
-    # comparison is against the same physical limits the optimised plan works
-    # under. Crediting the baseline with production clipped away for the
-    # devices would understate the savings the optimiser found.
+    # Sum of what the arrays, and the hybrid inverters' own panels, can
+    # actually deliver, accumulated below. The naive-cost baseline uses this
+    # rather than bundle.pv_forecast so that the comparison is against the
+    # same physical limits the optimised plan works under. Crediting the
+    # baseline with production clipped away for the devices would understate
+    # the savings the optimiser found.
     clipped_pv_kw = [0.0] * horizon
 
     for pv in pv_devices:
@@ -486,6 +487,12 @@ def build_and_solve(bundle: SolveBundle, config: MimirheimConfig) -> SolveResult
                 f"bundle.hybrid_inverter_inputs."
             )
         hi.add_constraints(ctx, inputs=hi_inputs)
+        # Without storage dispatch a hybrid's panels still feed the house,
+        # through its inverter, so the naive baseline counts them too.
+        for t, kw in enumerate(clip_forecast(hi_inputs.pv_forecast_kw, hi.config.max_pv_kw)):
+            if t >= horizon:
+                break
+            clipped_pv_kw[t] += kw * hi.config.inverter_efficiency
 
     for tb in thermal_boilers:
         tb_inputs = bundle.thermal_boiler_inputs.get(tb.name)
@@ -790,9 +797,9 @@ def build_and_solve(bundle: SolveBundle, config: MimirheimConfig) -> SolveResult
             bundle,
             horizon,
             dt,
-            # With no PV device configured there is nothing to clip against,
-            # so fall back to whatever the bundle carries.
-            pv_forecast_kw=clipped_pv_kw if pv_devices else None,
+            # With no PV array or hybrid inverter configured there is nothing
+            # to clip against, so fall back to whatever the bundle carries.
+            pv_forecast_kw=clipped_pv_kw if pv_devices or hybrid_inverters else None,
         ),
         optimised_cost_eur=_compute_optimised_cost(bundle, schedule, dt),
         soc_credit_eur=_compute_soc_credit(bundle, schedule, config, dt),
@@ -816,7 +823,9 @@ def _compute_naive_cost(
 
     The PV series is the one the arrays can actually deliver, clipped to each
     array's ceiling by the caller, so that the baseline and the optimised plan
-    are compared under the same physical limits.
+    are compared under the same physical limits. It includes each hybrid
+    inverter's own panels, clipped to ``max_pv_kw`` and taken through the
+    inverter: with no storage dispatch they still feed the house.
 
     Formula for each step t:
 
@@ -841,8 +850,10 @@ def _compute_naive_cost(
         pv_forecast_kw: PV production per step in kW, already clipped by the
             caller to each array's deliverable ceiling. That is the configured
             peak, or the highest production stage where a staged inverter's
-            registers stop below it. When None, ``bundle.pv_forecast`` is used
-            as it stands; callers without any configured PV array pass None.
+            registers stop below it. A hybrid inverter's panels are clipped to
+            ``max_pv_kw`` and then multiplied by ``inverter_efficiency``. When
+            None, ``bundle.pv_forecast`` is used as it stands; callers with
+            neither a PV array nor a hybrid inverter configured pass None.
 
     Returns:
         Naive cost in EUR. Negative values indicate net export revenue.

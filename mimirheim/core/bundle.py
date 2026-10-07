@@ -673,8 +673,9 @@ class SolveResult(BaseModel):
             ``"infeasible"`` (no feasible solution exists). When infeasible,
             ``schedule`` is empty and the previous retained schedule is used.
         naive_cost_eur: Estimated cost in EUR of the naive baseline over the
-            horizon: grid covers any shortfall between base load and PV at each
-            step, with no storage dispatch. Computed as
+            horizon: grid covers any shortfall between base load and PV (the
+            arrays and any hybrid inverter's own panels) at each step, with no
+            storage dispatch. Computed as
             ``sum(max(0, base_load[t] - pv[t]) * import_price[t] * dt)``.
             Zero for infeasible solves.
         optimised_cost_eur: Raw grid cash flow in EUR of the solved schedule:
