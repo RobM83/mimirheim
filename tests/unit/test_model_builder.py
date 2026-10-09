@@ -13,8 +13,14 @@ from datetime import datetime, timezone
 import pytest
 
 from mimirheim.config.schema import MimirheimConfig
-from mimirheim.core.bundle import DeviceSetpoint, SolveBundle
-from mimirheim.core.model_builder import _compute_naive_cost, build_and_solve
+from mimirheim.core.bundle import (
+    DeviceSetpoint,
+    HybridInverterInputs,
+    ScheduleStep,
+    SolveBundle,
+    SolveResult,
+)
+from mimirheim.core.model_builder import _compute_naive_cost, _compute_soc_credit, build_and_solve
 
 
 def _bundle(
@@ -255,3 +261,119 @@ def test_a_degraded_objective_is_reported_on_the_result() -> None:
     assert build_and_solve(bundle, config).strategy_degraded is False
     with patch.object(model_builder, "ObjectiveBuilder", _Degrading):
         assert build_and_solve(bundle, config).strategy_degraded is True
+
+
+def _hybrid_solve(*, start_soc_kwh: float, pv_kw: float, load_kw: float) -> SolveResult:
+    """Solve four flat-priced steps with one hybrid inverter and a static load."""
+    horizon = 4
+    config = MimirheimConfig.model_validate(
+        {
+            "mqtt": {"host": "localhost", "client_id": "test"},
+            "grid": {"import_limit_kw": 20.0, "export_limit_kw": 20.0},
+            "hybrid_inverters": {
+                "hi": {
+                    "capacity_kwh": 10.0,
+                    "max_charge_kw": 4.0,
+                    "max_discharge_kw": 4.0,
+                    "max_pv_kw": 4.0,
+                    "battery_charge_efficiency": 0.95,
+                    "battery_discharge_efficiency": 0.9,
+                    "inverter_efficiency": 0.96,
+                },
+            },
+            "static_loads": {"base": {}},
+        }
+    )
+    bundle = SolveBundle(
+        solve_time_utc=datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+        horizon_prices=[0.25] * horizon,
+        horizon_export_prices=[0.0] * horizon,
+        horizon_confidence=[1.0] * horizon,
+        pv_forecast=[0.0] * horizon,
+        base_load_forecast=[load_kw] * horizon,
+        hybrid_inverter_inputs={
+            "hi": HybridInverterInputs(soc_kwh=start_soc_kwh, pv_forecast_kw=[pv_kw] * horizon),
+        },
+    )
+    return build_and_solve(bundle, config)
+
+
+def test_soc_credit_counts_a_hybrid_inverter_charging_from_its_own_panels() -> None:
+    """Energy a hybrid inverter stores over the horizon is credited, like a battery's.
+
+    Export pays nothing and there is no load, so the panels' 4 kW can only go
+    into the cell: the SOC rises and the credit must be positive. It is valued
+    on the way out, cell to AC: avg import price x SOC change x discharge
+    efficiency x inverter efficiency.
+    """
+    result = _hybrid_solve(start_soc_kwh=2.0, pv_kw=4.0, load_kw=0.0)
+
+    end_soc = result.schedule[-1].devices["hi"].soc_kwh
+    assert end_soc > 2.0
+    assert result.soc_credit_eur > 0.0
+    assert result.soc_credit_eur == pytest.approx(0.25 * (end_soc - 2.0) * 0.9 * 0.96)
+
+
+def test_soc_credit_of_a_hybrid_inverter_follows_the_cell_not_the_ac_side() -> None:
+    """Solar passed straight through to the house is not energy stored.
+
+    With the cell full, the panels feed the load through the inverter: the
+    hybrid's AC kW is positive at every step while its SOC does not move. A
+    credit summed from AC kW, as for a plain battery, would come out strongly
+    negative; reading the SOC it must stay at the value of the SOC change.
+    """
+    result = _hybrid_solve(start_soc_kwh=10.0, pv_kw=2.0, load_kw=1.5)
+
+    assert all(step.devices["hi"].kw > 0.0 for step in result.schedule)
+    end_soc = result.schedule[-1].devices["hi"].soc_kwh
+    assert result.soc_credit_eur == pytest.approx(0.25 * (end_soc - 10.0) * 0.9 * 0.96)
+
+
+def test_soc_credit_skips_a_hybrid_inverter_it_cannot_value() -> None:
+    """No terminal SOC, no step for the device, or no config for the inputs:
+    no credit, and no error.
+
+    ``soc_kwh`` is optional on ``DeviceSetpoint`` and schedules from older
+    builds do not carry it for hybrid inverters.
+    """
+    config = MimirheimConfig.model_validate(
+        {
+            "mqtt": {"host": "localhost", "client_id": "test"},
+            "grid": {"import_limit_kw": 20.0, "export_limit_kw": 20.0},
+            "hybrid_inverters": {
+                name: {
+                    "capacity_kwh": 10.0,
+                    "max_charge_kw": 4.0,
+                    "max_discharge_kw": 4.0,
+                    "max_pv_kw": 4.0,
+                }
+                for name in ("hi", "absent")
+            },
+        }
+    )
+    bundle = SolveBundle(
+        solve_time_utc=datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+        horizon_prices=[0.25],
+        horizon_export_prices=[0.0],
+        horizon_confidence=[1.0],
+        pv_forecast=[0.0],
+        base_load_forecast=[0.0],
+        hybrid_inverter_inputs={
+            "hi": HybridInverterInputs(soc_kwh=2.0, pv_forecast_kw=[0.0]),
+            "absent": HybridInverterInputs(soc_kwh=2.0, pv_forecast_kw=[0.0]),
+            "unconfigured": HybridInverterInputs(soc_kwh=2.0, pv_forecast_kw=[0.0]),
+        },
+    )
+    schedule = [
+        ScheduleStep(
+            t=0,
+            grid_import_kw=0.0,
+            grid_export_kw=0.0,
+            devices={
+                "hi": DeviceSetpoint(kw=-2.0, type="hybrid_inverter"),
+                "unconfigured": DeviceSetpoint(kw=-2.0, type="hybrid_inverter", soc_kwh=2.5),
+            },
+        )
+    ]
+
+    assert _compute_soc_credit(bundle, schedule, config, 0.25) == 0.0
