@@ -132,6 +132,14 @@ dev = [
     "jinja2>=3.0",
 ]
 
+[tool.uv]
+# multidict is a transitive dependency only (aiohttp -> yarl -> multidict).
+# Constrained rather than declared as a direct dependency: nothing here imports
+# it, we only need to keep the resolver off the vulnerable versions below 6.9.1.
+constraint-dependencies = [
+    "multidict>=6.9.1",
+]
+
 [tool.uv.workspace]
 members = ["mimirheim_shared"]
 
