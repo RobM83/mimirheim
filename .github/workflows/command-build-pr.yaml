@@ -1,0 +1,43 @@
+name: Build PR image on command
+
+# ChatOps gate for build-pr.yaml. A maintainer comments "/build-pr" on a pull
+# request and this workflow dispatches the image build for that PR. Nothing is
+# built automatically, and no deployment approval request is created, so no
+# notification traffic is generated for contributors or maintainers.
+#
+# issue_comment always runs the default-branch copy of this file, so a pull
+# request cannot modify its own gate.
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  dispatch:
+    name: Dispatch PR image build
+    runs-on: ubuntu-latest
+    # author_association is the authorisation gate: only the repository owner,
+    # an organisation member, or an invited collaborator may trigger a build.
+    # Note this admits collaborators with read-only access as well; tighten the
+    # list to OWNER if that ever matters.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/build-pr') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    permissions:
+      actions: write
+      issues: write
+
+    steps:
+      - name: Dispatch build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          REF: ${{ github.event.repository.default_branch }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-pr.yaml --repo "$REPO" --ref "$REF" -f pr="$PR"
+          # Silent acknowledgement: a reaction notifies nobody, unlike a reply
+          # comment. Absence of the reaction means the dispatch failed.
+          gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=rocket

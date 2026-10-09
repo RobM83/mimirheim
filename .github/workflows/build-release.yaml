@@ -80,17 +80,17 @@ jobs:
             type=raw,value=stable
             type=ref,event=tag
           labels: |
-            io.hass.name="${{ env.BUILD_NAME }}" \
-            io.hass.description="${{ env.BUILD_DESCRIPTION }}" \
-            io.hass.arch="${{ env.BUILD_ARCH }}" \
-            io.hass.type="addon" \
-            io.hass.version="${{ env.BUILD_VERSION }}" \
-            org.opencontainers.image.title="${{ env.BUILD_NAME }}" \
-            org.opencontainers.image.description="${{ env.BUILD_DESCRIPTION }}" \
-            org.opencontainers.image.created="${{ env.BUILD_DATE }}" \
-            org.opencontainers.image.revision="${{ env.BUILD_REF }}" \
-            org.opencontainers.image.source="https://github.com/jsimonetti/mimirheim" \
-            org.opencontainers.image.version="${{ env.BUILD_VERSION }}"
+            io.hass.name=${{ env.BUILD_NAME }}
+            io.hass.description=${{ env.BUILD_DESCRIPTION }}
+            io.hass.arch=${{ env.BUILD_ARCH }}
+            io.hass.type=addon
+            io.hass.version=${{ env.BUILD_VERSION }}
+            org.opencontainers.image.title=${{ env.BUILD_NAME }}
+            org.opencontainers.image.description=${{ env.BUILD_DESCRIPTION }}
+            org.opencontainers.image.created=${{ env.BUILD_DATE }}
+            org.opencontainers.image.revision=${{ env.BUILD_REF }}
+            org.opencontainers.image.source=https://github.com/jsimonetti/mimirheim
+            org.opencontainers.image.version=${{ env.BUILD_VERSION }}
 
       # See build-edge.yaml for why SOURCE_DATE_EPOCH is a fixed constant.
       #

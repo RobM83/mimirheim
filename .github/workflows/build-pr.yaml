@@ -1,11 +1,19 @@
 name: Build PR image and push to GHCR
 
+# Building a PR image runs the PR's own Dockerfile in a job holding a
+# packages:write token, so it is never automatic. A maintainer dispatches it
+# explicitly, either from the Actions tab or by commenting /build-pr on the PR
+# (see command-build-pr.yaml).
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, closed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to build"
+        required: true
+        type: string
 
 concurrency:
-  group: build-pr-${{ github.event.pull_request.number }}
+  group: build-pr-${{ inputs.pr }}
   cancel-in-progress: true
 
 env:
@@ -14,36 +22,46 @@ env:
   BUILD_NAME: Mimirheim
   BUILD_DESCRIPTION: MILP energy optimiser for home battery, PV, and EV scheduling against dynamic electricity prices.
   BUILD_ARCH: amd64, aarch64
-  BUILD_VERSION: pr-${{ github.event.pull_request.number }}
-  BUILD_DATE: ${{ github.event.pull_request.updated_at }}
-  BUILD_REF: ${{ github.event.pull_request.head.sha }}
+  BUILD_VERSION: pr-${{ inputs.pr }}
 
 jobs:
   build-and-push-image:
     name: Build PR image and push to GHCR
     runs-on: ubuntu-latest
-    # Skip the build when the PR is closed or merged. The 'closed' event
-    # still enters the same concurrency group, which cancels any in-progress
-    # run before this condition causes the new run to exit immediately.
-    if: github.event.action != 'closed'
-    # The 'pr-image' environment has required reviewers configured in
-    # GitHub repo Settings → Environments. GitHub pauses this job until
-    # a maintainer manually approves the deployment, preventing untrusted
-    # PR code from running the build automatically.
-    # Setup: Settings → Environments → New environment → "pr-image" →
-    #        add required reviewers.
-    environment: pr-image
     permissions:
       contents: read
       packages: write
       pull-requests: read
 
     steps:
+      # Resolves the head commit rather than trusting a caller-supplied SHA, so
+      # the image always matches what the PR currently shows.
+      - name: Resolve pull request head
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR" =~ ^[0-9]+$ ]]; then
+            echo "::error::'$PR' is not a pull request number"
+            exit 1
+          fi
+          json=$(gh pr view "$PR" --repo "$REPO" \
+            --json headRefOid,updatedAt,headRepository,headRepositoryOwner)
+          {
+            echo "sha=$(jq -r .headRefOid <<<"$json")"
+            echo "date=$(jq -r .updatedAt <<<"$json")"
+            echo "repo=$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<<"$json")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ steps.pr.outputs.repo }}
+          ref: ${{ steps.pr.outputs.sha }}
 
       - name: Setup Buildkit
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -63,19 +81,19 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=pr-${{ github.event.pull_request.number }}
+            type=raw,value=pr-${{ inputs.pr }}
           labels: |
-            io.hass.name="${{ env.BUILD_NAME }}" \
-            io.hass.description="${{ env.BUILD_DESCRIPTION }}" \
-            io.hass.arch="${{ env.BUILD_ARCH }}" \
-            io.hass.type="addon" \
-            io.hass.version="${{ env.BUILD_VERSION }}" \
-            org.opencontainers.image.title="${{ env.BUILD_NAME }}" \
-            org.opencontainers.image.description="${{ env.BUILD_DESCRIPTION }}" \
-            org.opencontainers.image.created="${{ env.BUILD_DATE }}" \
-            org.opencontainers.image.revision="${{ env.BUILD_REF }}" \
-            org.opencontainers.image.source="https://github.com/jsimonetti/mimirheim" \
-            org.opencontainers.image.version="${{ env.BUILD_VERSION }}"
+            io.hass.name=${{ env.BUILD_NAME }}
+            io.hass.description=${{ env.BUILD_DESCRIPTION }}
+            io.hass.arch=${{ env.BUILD_ARCH }}
+            io.hass.type=addon
+            io.hass.version=${{ env.BUILD_VERSION }}
+            org.opencontainers.image.title=${{ env.BUILD_NAME }}
+            org.opencontainers.image.description=${{ env.BUILD_DESCRIPTION }}
+            org.opencontainers.image.created=${{ steps.pr.outputs.date }}
+            org.opencontainers.image.revision=${{ steps.pr.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/jsimonetti/mimirheim
+            org.opencontainers.image.version=${{ env.BUILD_VERSION }}
 
       # See build-edge.yaml for why SOURCE_DATE_EPOCH is a fixed constant.
       #
