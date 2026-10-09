@@ -689,7 +689,7 @@ class SolveResult(BaseModel):
             Positive when the horizon ends with more energy stored than it
             started with. Computed as
             ``avg_import_price × soc_delta_cell_kwh × avg_discharge_eff``
-            per device, summed across all storage devices. Add this to
+            per device, summed across all storage devices. Subtract from
             ``optimised_cost_eur`` to compare fairly against ``naive_cost_eur``:
             ``effective_cost = optimised_cost_eur - soc_credit_eur``.
             Zero for infeasible solves.

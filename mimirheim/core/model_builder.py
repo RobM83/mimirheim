@@ -802,7 +802,7 @@ def build_and_solve(bundle: SolveBundle, config: MimirheimConfig) -> SolveResult
             pv_forecast_kw=clipped_pv_kw if pv_devices or hybrid_inverters else None,
         ),
         optimised_cost_eur=_compute_optimised_cost(bundle, schedule, dt),
-        soc_credit_eur=_compute_soc_credit(bundle, schedule, config, dt),
+        soc_credit_eur=_compute_soc_credit(bundle, schedule, config),
         schedule=schedule,
         deferrable_recommended_starts=deferrable_recommended_starts,
         battery_care=battery_care,
@@ -932,11 +932,26 @@ def _avg_discharge_efficiency(
     return 1.0
 
 
+def _terminal_soc_kwh(schedule: list[ScheduleStep], name: str) -> float | None:
+    """Return a device's cell SOC at the final step of the schedule.
+
+    Args:
+        schedule: Assembled schedule from the solver. Must be non-empty.
+        name: Device name to look up in the final step.
+
+    Returns:
+        The terminal SOC in kWh, or None when the schedule carries no setpoint
+        for the device or the setpoint has no ``soc_kwh``. Either way there is
+        no SOC change to value.
+    """
+    last = schedule[-1].devices.get(name)
+    return None if last is None else last.soc_kwh
+
+
 def _compute_soc_credit(
     bundle: SolveBundle,
     schedule: list[ScheduleStep],
     config: MimirheimConfig,
-    dt: float,
 ) -> float:
     """Compute the estimated future value of stored energy built up over the horizon.
 
@@ -947,31 +962,23 @@ def _compute_soc_credit(
 
     Formula per storage device:
 
-        delta_kwh = -sum(ac_kw[t] * dt for t in horizon)
-        soc_credit += avg_import_price * delta_kwh * avg_discharge_eff
-
-    ``delta_kwh`` is the net energy the device took in across the horizon,
-    measured at the AC terminals: ``ac_kw`` is positive when discharging and
-    negative when charging, so negating the sum gives energy absorbed. It is
-    deliberately an AC-side figure rather than the cell-side SOC delta the
-    schedule also carries in ``DeviceSetpoint.soc_kwh``. Charge efficiency is
-    therefore treated as 1 at this stage and only the discharge efficiency is
-    applied when pricing the credit, which slightly overstates the value of
-    energy taken in. The error is small relative to the rounding already
-    applied to the published figures, and using the AC side keeps the credit
-    directly comparable with ``optimised_cost_eur``, which is also an AC-side
-    cash flow.
-
-    A hybrid inverter's AC ``kw`` cannot be used this way: it is the net of
-    its own panels and its battery, so solar passed straight through to the
-    house would count as energy drained from the cell. For a hybrid inverter
-    the change is therefore read from the cell itself, starting SOC to the
-    last step's ``soc_kwh``, and priced on the way out through the battery's
-    discharge efficiency and the inverter:
-
         delta_kwh = soc_kwh[T-1] - initial_soc_kwh
-        soc_credit += avg_import_price * delta_kwh
-                      * battery_discharge_efficiency * inverter_efficiency
+        soc_credit += avg_import_price * delta_kwh * discharge_eff
+
+    ``delta_kwh`` is measured at the cell, not at the AC terminals, because
+    the question the credit answers is how much energy remains available to
+    discharge later. Charging losses never reach the cell and so are not
+    stored energy; discharge losses mean a cell gives up more than the AC
+    figure in order to deliver it. Summing the schedule's AC kW instead
+    overstates the credit in both directions. ``discharge_eff`` converts the
+    cell figure back to AC, which is what makes the credit comparable with
+    ``optimised_cost_eur``.
+
+    For a battery or an EV charger the single discharge efficiency already
+    spans the whole cell-to-AC path. A hybrid inverter splits that path into
+    a cell-level ``battery_discharge_efficiency`` and a separate
+    ``inverter_efficiency``, so its two factors multiply to the equivalent
+    figure.
 
     A positive credit means the horizon ends with more stored energy than it
     started with. Subtract from ``optimised_cost_eur`` for a fair comparison
@@ -979,9 +986,9 @@ def _compute_soc_credit(
 
     Args:
         bundle: Solve inputs providing initial SOC per device and import prices.
-        schedule: Assembled schedule from the solver.
+        schedule: Assembled schedule from the solver. Must be non-empty;
+            infeasible solves return before this is called.
         config: Static system configuration providing efficiency curves.
-        dt: Step duration in hours (always 0.25 for 15-minute steps).
 
     Returns:
         Estimated future value of the net SOC change in EUR. May be negative
@@ -992,46 +999,42 @@ def _compute_soc_credit(
 
     credit = 0.0
 
-    for name in bundle.battery_inputs:
+    for name, bat_inputs in bundle.battery_inputs.items():
         bat_cfg = config.batteries.get(name)
+        terminal_soc = _terminal_soc_kwh(schedule, name)
+        if bat_cfg is None or terminal_soc is None:
+            continue
         discharge_eff = _avg_discharge_efficiency(
-            bat_cfg.discharge_segments if bat_cfg else None,
-            bat_cfg.discharge_efficiency_curve if bat_cfg else None,
+            bat_cfg.discharge_segments,
+            bat_cfg.discharge_efficiency_curve,
         )
-        # Net energy absorbed, from the AC kW in the schedule.
-        # Positive kw = discharge (SOC decreases); negative kw = charge.
-        soc_delta = -sum(
-            step.devices[name].kw * dt
-            for step in schedule
-            if name in step.devices
-        )
-        credit += avg_import_price * soc_delta * discharge_eff
+        credit += avg_import_price * (terminal_soc - bat_inputs.soc_kwh) * discharge_eff
 
-    for name, inputs in bundle.ev_inputs.items():
-        if not inputs.available:
+    for name, ev_inputs in bundle.ev_inputs.items():
+        # An unplugged EV gets no SOC balance constraint, so soc[t] is a free
+        # variable that reads as its lower bound rather than the vehicle's real
+        # SOC. Valuing that against the real initial SOC would debit the whole
+        # pack as though it had been emptied.
+        if not ev_inputs.available:
             continue
         ev_cfg = config.ev_chargers.get(name)
+        terminal_soc = _terminal_soc_kwh(schedule, name)
+        if ev_cfg is None or terminal_soc is None:
+            continue
         discharge_eff = _avg_discharge_efficiency(
-            ev_cfg.discharge_segments if ev_cfg else None,
+            ev_cfg.discharge_segments,
             None,  # EvConfig uses only the segments model; no SOS2 curve
         )
-        soc_delta = -sum(
-            step.devices[name].kw * dt
-            for step in schedule
-            if name in step.devices
-        )
-        credit += avg_import_price * soc_delta * discharge_eff
+        credit += avg_import_price * (terminal_soc - ev_inputs.soc_kwh) * discharge_eff
 
-    for name, inputs in bundle.hybrid_inverter_inputs.items():
+    for name, hi_inputs in bundle.hybrid_inverter_inputs.items():
         hi_cfg = config.hybrid_inverters.get(name)
-        last = schedule[-1].devices.get(name)
-        # Without a terminal SOC there is no change to value. soc_kwh is
-        # optional on DeviceSetpoint, and schedules from older builds lack it.
-        if hi_cfg is None or last is None or last.soc_kwh is None:
+        terminal_soc = _terminal_soc_kwh(schedule, name)
+        if hi_cfg is None or terminal_soc is None:
             continue
         credit += (
             avg_import_price
-            * (last.soc_kwh - inputs.soc_kwh)
+            * (terminal_soc - hi_inputs.soc_kwh)
             * hi_cfg.battery_discharge_efficiency
             * hi_cfg.inverter_efficiency
         )

@@ -1,5 +1,7 @@
 {
   "strategy": "minimize_cost",
+  "strategy_degraded": false,
+  "solve_time_utc": "2026-03-30T00:00:00Z",
   "objective_value": -4.000000000000001,
   "solve_status": "optimal",
   "dispatch_suppressed": false,
@@ -1640,5 +1642,6 @@
       }
     }
   ],
-  "deferrable_recommended_starts": {}
+  "deferrable_recommended_starts": {},
+  "battery_care": {}
 }

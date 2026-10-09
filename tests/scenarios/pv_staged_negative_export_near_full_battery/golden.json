@@ -1,11 +1,13 @@
 {
   "strategy": "minimize_cost",
+  "strategy_degraded": false,
+  "solve_time_utc": "2026-04-07T13:00:00Z",
   "objective_value": -4.994389886249999,
   "solve_status": "optimal",
   "dispatch_suppressed": false,
   "naive_cost_eur": 0.395,
   "optimised_cost_eur": 0.001201875000000045,
-  "soc_credit_eur": 0.013770546874999885,
+  "soc_credit_eur": 0.011874999999999957,
   "schedule": [
     {
       "t": 0,
@@ -156,5 +158,6 @@
       }
     }
   ],
-  "deferrable_recommended_starts": {}
+  "deferrable_recommended_starts": {},
+  "battery_care": {}
 }

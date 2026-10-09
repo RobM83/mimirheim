@@ -14,7 +14,9 @@ import pytest
 
 from mimirheim.config.schema import MimirheimConfig
 from mimirheim.core.bundle import (
+    BatteryInputs,
     DeviceSetpoint,
+    EvInputs,
     HybridInverterInputs,
     ScheduleStep,
     SolveBundle,
@@ -451,4 +453,177 @@ def test_soc_credit_skips_a_hybrid_inverter_it_cannot_value() -> None:
         )
     ]
 
-    assert _compute_soc_credit(bundle, schedule, config, 0.25) == 0.0
+    assert _compute_soc_credit(bundle, schedule, config) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# soc_credit_eur is measured at the cell for every storage device
+# ---------------------------------------------------------------------------
+
+
+def _storage_config() -> MimirheimConfig:
+    """One battery and one V2H EV charger, both charging at 95%.
+
+    The two discharge efficiencies differ so that a loop reading the wrong
+    device's config, or the two being swapped, changes the result.
+    """
+    return MimirheimConfig.model_validate(
+        {
+            "mqtt": {"host": "localhost", "client_id": "test"},
+            "grid": {"import_limit_kw": 20.0, "export_limit_kw": 20.0},
+            "batteries": {
+                "bat": {
+                    "capacity_kwh": 10.0,
+                    "charge_segments": [{"power_max_kw": 4.0, "efficiency": 0.95}],
+                    "discharge_segments": [{"power_max_kw": 4.0, "efficiency": 0.9}],
+                }
+            },
+            "ev_chargers": {
+                "ev": {
+                    "capacity_kwh": 40.0,
+                    "charge_segments": [{"power_max_kw": 4.0, "efficiency": 0.95}],
+                    "discharge_segments": [{"power_max_kw": 4.0, "efficiency": 0.85}],
+                }
+            },
+        }
+    )
+
+
+# Discharge efficiency per device under test, matching _storage_config.
+_STORAGE_CASES = [("bat", "battery", 0.9), ("ev", "ev_charger", 0.85)]
+
+
+def _storage_bundle() -> SolveBundle:
+    """A single step at 0.25 EUR/kWh with both storage devices at 2 kWh."""
+    return SolveBundle(
+        solve_time_utc=datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+        horizon_prices=[0.25],
+        horizon_export_prices=[0.0],
+        horizon_confidence=[1.0],
+        pv_forecast=[0.0],
+        base_load_forecast=[0.0],
+        battery_inputs={"bat": BatteryInputs(soc_kwh=2.0)},
+        ev_inputs={"ev": EvInputs(soc_kwh=2.0, available=True)},
+    )
+
+
+def _one_step(name: str, device_type: str, *, kw: float, soc_kwh: float) -> list[ScheduleStep]:
+    """A one-step schedule carrying a single storage device's AC power and SOC."""
+    return [
+        ScheduleStep(
+            t=0,
+            # Grid flows are irrelevant to the credit, which reads only SOC.
+            grid_import_kw=max(-kw, 0.0),
+            grid_export_kw=0.0,
+            devices={name: DeviceSetpoint(kw=kw, type=device_type, soc_kwh=soc_kwh)},
+        )
+    ]
+
+
+@pytest.mark.parametrize(("name", "device_type", "discharge_eff"), _STORAGE_CASES)
+def test_soc_credit_of_absorbed_energy_is_measured_at_the_cell(
+    name: str, device_type: str, discharge_eff: float
+) -> None:
+    """Charging losses must not be credited as stored energy.
+
+    The device absorbs 4 kW for a quarter hour, so 1.0 kWh crosses its AC
+    terminals but only 0.95 kWh reaches the cell. Valuing the AC figure
+    credits energy that was lost as heat in the charger and never existed in
+    the cell to be discharged later.
+    """
+    credit = _compute_soc_credit(
+        _storage_bundle(),
+        _one_step(name, device_type, kw=-4.0, soc_kwh=2.95),
+        _storage_config(),
+    )
+
+    # 0.95 kWh gained at the cell, worth discharge_eff x that at the AC
+    # terminals on the way back out, valued at the average import price.
+    assert credit == pytest.approx(0.25 * 0.95 * discharge_eff)
+
+
+@pytest.mark.parametrize(("name", "device_type", "discharge_eff"), _STORAGE_CASES)
+def test_soc_credit_of_delivered_energy_is_measured_at_the_cell(
+    name: str, device_type: str, discharge_eff: float
+) -> None:
+    """Energy spent from the cell is debited in full, not net of discharge loss.
+
+    The device delivers 3.6 kW for a quarter hour, which is 0.9 kWh of AC. The
+    cell gave up 1.0 kWh to produce it. Charging the AC figure understates the
+    loss, so the horizon looks cheaper than it was.
+    """
+    credit = _compute_soc_credit(
+        _storage_bundle(),
+        _one_step(name, device_type, kw=3.6, soc_kwh=1.0),
+        _storage_config(),
+    )
+
+    # 1.0 kWh drained from the cell, worth discharge_eff kWh of AC.
+    assert credit == pytest.approx(-0.25 * 1.0 * discharge_eff)
+
+
+def test_soc_credit_skips_an_unavailable_ev() -> None:
+    """An unplugged EV's soc[t] is a free variable, not its real SOC.
+
+    The availability gate forces the power variables to zero and returns
+    without adding a SOC balance constraint, so the schedule reports the
+    variable's lower bound. Valuing that against the real initial SOC would
+    debit the whole pack as though it had been emptied. Under the superseded
+    AC-side formula the guard was redundant, because the AC power was pinned
+    to zero; it is now the only thing preventing a large wrong figure.
+    """
+    bundle = _storage_bundle().model_copy(
+        update={"ev_inputs": {"ev": EvInputs(soc_kwh=20.0, available=False)}}
+    )
+
+    credit = _compute_soc_credit(
+        bundle,
+        _one_step("ev", "ev_charger", kw=0.0, soc_kwh=0.0),
+        _storage_config(),
+    )
+
+    assert credit == 0.0
+
+
+def test_soc_credit_of_a_battery_follows_the_solver_soc() -> None:
+    """End to end: the credit is derived from the SOC the solver reported.
+
+    Prices fall across the horizon and nothing consumes power, so the battery
+    charges in the cheap steps and ends fuller than it started. Asserting
+    through build_and_solve proves soc_kwh is populated on the real path, not
+    only in hand-built schedules.
+    """
+    horizon = 4
+    config = MimirheimConfig.model_validate(
+        {
+            "mqtt": {"host": "localhost", "client_id": "test"},
+            "grid": {"import_limit_kw": 20.0, "export_limit_kw": 20.0},
+            "batteries": {
+                "bat": {
+                    "capacity_kwh": 10.0,
+                    "charge_segments": [{"power_max_kw": 4.0, "efficiency": 0.95}],
+                    "discharge_segments": [{"power_max_kw": 4.0, "efficiency": 0.9}],
+                }
+            },
+        }
+    )
+    bundle = SolveBundle(
+        solve_time_utc=datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+        horizon_prices=[0.05, 0.05, 0.40, 0.40],
+        horizon_export_prices=[0.0] * horizon,
+        horizon_confidence=[1.0] * horizon,
+        pv_forecast=[0.0] * horizon,
+        base_load_forecast=[2.0] * horizon,
+        battery_inputs={"bat": BatteryInputs(soc_kwh=2.0)},
+    )
+
+    result = build_and_solve(bundle, config)
+
+    end_soc = result.schedule[-1].devices["bat"].soc_kwh
+    assert end_soc is not None
+    # Without this the solver leaving the battery alone would make both sides
+    # of the assertion below zero, passing green while proving nothing.
+    assert end_soc > 2.0
+    avg_price = sum(bundle.horizon_prices) / horizon
+    assert result.soc_credit_eur == pytest.approx(avg_price * (end_soc - 2.0) * 0.9)
+

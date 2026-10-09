@@ -63,6 +63,13 @@ def test_golden_scenario(
     assert result.solve_status == golden.solve_status
     assert result.objective_value == pytest.approx(golden.objective_value, abs=1e-4)
 
+    # The reported economics are derived from the schedule but are not implied
+    # by it: soc_credit_eur in particular reads per-device SOC, which the
+    # step comparison below does not cover.
+    assert result.naive_cost_eur == pytest.approx(golden.naive_cost_eur, abs=1e-6)
+    assert result.optimised_cost_eur == pytest.approx(golden.optimised_cost_eur, abs=1e-6)
+    assert result.soc_credit_eur == pytest.approx(golden.soc_credit_eur, abs=1e-6)
+
     # Compare schedule step-by-step.
     assert len(result.schedule) == len(golden.schedule)
     for step, g_step in zip(result.schedule, golden.schedule, strict=True):
@@ -78,3 +85,14 @@ def test_golden_scenario(
                 f"step={step.t} device={name!r}: "
                 f"{setpoint.kw} != {g_step.devices[name].kw}"
             )
+            g_soc = g_step.devices[name].soc_kwh
+            if g_soc is None:
+                assert setpoint.soc_kwh is None, (
+                    f"step={step.t} device={name!r}: "
+                    f"gained a SOC reading of {setpoint.soc_kwh}"
+                )
+            else:
+                assert setpoint.soc_kwh == pytest.approx(g_soc, abs=1e-4), (
+                    f"step={step.t} device={name!r}: "
+                    f"{setpoint.soc_kwh} != {g_soc}"
+                )
